@@ -1,17 +1,15 @@
 """
-Spy Game Dataset for Flow-GRPO Bagel Training.
+Spy Game Data Generator for Flow-GRPO Bagel Training.
 
-Generates CLEVR-style scene description pairs (original/modified) for the
-"Who's the Odd One Out?" spy-civ game. Each sample provides a prompt for
-Bagel image generation and metadata for the spy game reward.
+Generates CLEVR-style scene description pairs and orchestrates the
+"Who's the Odd One Out?" spy-civ game. Adapted from:
+  - SPY-UMM/data/game_data_generator.py (game logic)
+  - SPY-UMM/data/scene_description_generator.py (scene generation)
 """
 
-import json
-import os
 import random
-from typing import Dict, Any, List, Tuple
-
-from torch.utils.data import Dataset
+import re
+from typing import Dict, Any, List, Tuple, Optional
 
 
 # ─── CLEVR-style object properties ───────────────────────────────────────────
@@ -26,16 +24,14 @@ ABSOLUTE_POSITIONS = [
 ]
 
 
-# ─── Scene generation (adapted from SPY-UMM/data/scene_description_generator.py)
-def _generate_object(rng: random.Random,
-                     exclude: List[Tuple[str, str, str, str]] = None) -> Dict[str, str]:
+# ─── Scene generation ────────────────────────────────────────────────────────
+
+def _generate_object(rng, exclude=None):
     exclude = exclude or []
     for _ in range(100):
         obj = {
-            'color': rng.choice(COLORS),
-            'shape': rng.choice(SHAPES),
-            'size': rng.choice(SIZES),
-            'material': rng.choice(MATERIALS),
+            'color': rng.choice(COLORS), 'shape': rng.choice(SHAPES),
+            'size': rng.choice(SIZES), 'material': rng.choice(MATERIALS),
         }
         key = (obj['color'], obj['shape'], obj['size'], obj['material'])
         if key not in exclude:
@@ -43,162 +39,278 @@ def _generate_object(rng: random.Random,
     return obj
 
 
-def _generate_scene(rng: random.Random, num_min: int = 3,
-                    num_max: int = 6) -> List[Dict[str, str]]:
-    num_objects = rng.randint(num_min, num_max)
-    objects = []
-    used_keys = []
-    for i in range(num_objects):
-        obj = _generate_object(rng, exclude=used_keys)
+def _generate_scene(rng, num_min=3, num_max=6):
+    n = rng.randint(num_min, num_max)
+    objects, used = [], []
+    for i in range(n):
+        obj = _generate_object(rng, exclude=used)
         obj['position'] = rng.choice(ABSOLUTE_POSITIONS)
         obj['index'] = i
         objects.append(obj)
-        used_keys.append((obj['color'], obj['shape'], obj['size'], obj['material']))
+        used.append((obj['color'], obj['shape'], obj['size'], obj['material']))
     return objects
 
 
-def _modify_scene(rng: random.Random, objects: List[Dict[str, str]],
-                  num_modify: int = 2) -> Tuple[List[Dict[str, str]], List[int]]:
-    modified = [dict(obj) for obj in objects]
+def _modify_scene(rng, objects, num_modify=2):
+    modified = [dict(o) for o in objects]
     num_modify = min(num_modify, len(objects))
-    modify_indices = rng.sample(range(len(objects)), num_modify)
-    existing_keys = [
-        (o['color'], o['shape'], o['size'], o['material']) for o in objects
-    ]
-    for idx in modify_indices:
-        old_obj = modified[idx]
-        new_obj = _generate_object(rng, exclude=existing_keys)
-        new_obj['position'] = old_obj['position']
-        new_obj['index'] = old_obj['index']
-        modified[idx] = new_obj
-        existing_keys[idx] = (new_obj['color'], new_obj['shape'],
-                              new_obj['size'], new_obj['material'])
-    return modified, modify_indices
+    indices = rng.sample(range(len(objects)), num_modify)
+    existing = [(o['color'], o['shape'], o['size'], o['material']) for o in objects]
+    for idx in indices:
+        new = _generate_object(rng, exclude=existing)
+        new['position'] = modified[idx]['position']
+        new['index'] = modified[idx]['index']
+        modified[idx] = new
+        existing[idx] = (new['color'], new['shape'], new['size'], new['material'])
+    return modified, indices
 
 
-def _describe_scene(objects: List[Dict[str, str]], style: str = 'list') -> str:
+def _describe_scene(objects, style='list'):
     if not objects:
         return "An empty scene."
-
-    descriptions = []
-    for obj in objects:
-        desc = f"a {obj['size']} {obj['color']} {obj['material']} {obj['shape']}"
-        descriptions.append(f"{desc} {obj['position']}")
-
-    if len(descriptions) == 1:
-        return f"A scene with {descriptions[0]}."
-
+    descs = [f"a {o['size']} {o['color']} {o['material']} {o['shape']} {o['position']}"
+             for o in objects]
+    if len(descs) == 1:
+        return f"A scene with {descs[0]}."
     if style == 'list':
-        items = ', '.join(descriptions[:-1]) + f', and {descriptions[-1]}'
-        return f"A scene containing {items}."
+        return f"A scene containing {', '.join(descs[:-1])}, and {descs[-1]}."
     elif style == 'narrative':
-        parts = []
-        for i, desc in enumerate(descriptions):
-            if i == 0:
-                parts.append(f"There is {desc}")
-            elif i == len(descriptions) - 1:
-                parts.append(f"and {desc}")
-            else:
-                parts.append(desc)
+        parts = [f"There is {descs[0]}"] + descs[1:-1] + [f"and {descs[-1]}"]
         return '. '.join(parts) + '.'
-    else:  # structured
-        lines = ["Scene description:"]
-        for i, desc in enumerate(descriptions):
-            lines.append(f"- Object {i+1}: {desc}")
+    else:
+        lines = ["Scene description:"] + [f"- Object {i+1}: {d}" for i, d in enumerate(descs)]
         return ' '.join(lines)
 
 
-def generate_scene_pair(seed: int) -> Tuple[str, str, Dict[str, Any]]:
+def generate_scene_pair(seed):
     """Generate (original_desc, modified_desc, metadata) pair."""
     rng = random.Random(seed)
     objects = _generate_scene(rng)
-    modified_objects, modify_indices = _modify_scene(rng, objects)
+    modified, indices = _modify_scene(rng, objects)
     style = rng.choice(['list', 'narrative', 'structured'])
-    original_desc = _describe_scene(objects, style=style)
-    modified_desc = _describe_scene(modified_objects, style=style)
-
-    differences = []
-    for idx in modify_indices:
-        differences.append({
-            'position_index': idx,
-            'original': {k: objects[idx][k] for k in ('color', 'shape', 'size', 'material')},
-            'modified': {k: modified_objects[idx][k] for k in ('color', 'shape', 'size', 'material')},
-        })
-
-    metadata = {
-        'num_objects': len(objects),
-        'num_modified': len(modify_indices),
-        'modify_indices': modify_indices,
-        'differences': differences,
-    }
-    return original_desc, modified_desc, metadata
+    orig = _describe_scene(objects, style=style)
+    mod = _describe_scene(modified, style=style)
+    diffs = [{
+        'position_index': idx,
+        'original': {k: objects[idx][k] for k in ('color', 'shape', 'size', 'material')},
+        'modified': {k: modified[idx][k] for k in ('color', 'shape', 'size', 'material')},
+    } for idx in indices]
+    return orig, mod, {'num_objects': len(objects), 'differences': diffs}
 
 
-# ─── Dataset classes ─────────────────────────────────────────────────────────
+# ─── Game Data Generator (adapted from SPY-UMM/data/game_data_generator.py) ─
 
-class SpyGamePromptDataset(Dataset):
-    """Dataset that yields scene descriptions for spy-civ game training.
+class SpyGameDataGenerator:
+    """Generates spy game instances for Bagel text-to-image training.
 
-    Supports two modes:
-    - 'jsonl': Load pre-generated pairs from a JSONL file.
-    - 'procedural': Generate pairs on-the-fly from seeds.
-
-    Each item returns a prompt (the scene description Bagel will generate an
-    image for) and metadata needed by the spy game reward function.
+    Game flow:
+      1. Generate text description pair (original vs modified)
+      2. Assign spy player (gets modified description)
+      3. Each player generates an image from their description
+      4. All players see all images and vote on who is the spy
     """
 
-    def __init__(self, dataset_path: str, split: str = 'train',
-                 num_players: int = 4, num_procedural: int = 10000):
+    def __init__(self, num_players=4, num_objects_min=3, num_objects_max=6,
+                 num_to_modify=2):
         self.num_players = num_players
-        self.items: List[Dict[str, Any]] = []
+        self.num_objects_min = num_objects_min
+        self.num_objects_max = num_objects_max
+        self.num_to_modify = num_to_modify
+        # EMA baselines
+        self.b_spy = 0.0
+        self.b_civ = 0.0
+        self.ema_alpha = 0.9
+        self.update_count = 0
 
-        jsonl_path = os.path.join(dataset_path, f'{split}.jsonl')
-        if os.path.exists(jsonl_path):
-            self._load_jsonl(jsonl_path)
-        else:
-            self._generate_procedural(num_procedural, split)
+    def generate_game(self, epoch, sample_idx):
+        """Generate a complete game instance."""
+        seed = epoch * 10000 + sample_idx
+        orig, mod, diff_meta = generate_scene_pair(seed)
+        rng = random.Random(seed + 1)
+        spy_player = rng.randint(1, self.num_players)
 
-    def _load_jsonl(self, path: str):
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line.strip())
-                self.items.append({
-                    'original_desc': data['original_desc'],
-                    'modified_desc': data['modified_desc'],
-                    'diff_metadata': data.get('diff_metadata', {}),
-                })
+        player_descriptions = []
+        for pid in range(1, self.num_players + 1):
+            player_descriptions.append(mod if pid == spy_player else orig)
 
-    def _generate_procedural(self, n: int, split: str):
-        base_seed = 0 if split == 'train' else 1_000_000
-        for i in range(n):
-            orig, mod, meta = generate_scene_pair(seed=base_seed + i)
-            self.items.append({
-                'original_desc': orig,
-                'modified_desc': mod,
-                'diff_metadata': meta,
-            })
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        item = self.items[idx]
-        # The spy player gets modified_desc as prompt; civilians get original.
-        # For GRPO, we use the *original* description as the prompt so that
-        # K images in a group are from the same prompt (standard GRPO).
-        # The modified description is passed in metadata for the game reward.
         return {
-            "prompt": item['original_desc'],
-            "metadata": {
-                "original_desc": item['original_desc'],
-                "modified_desc": item['modified_desc'],
-                "diff_metadata": item.get('diff_metadata', {}),
-                "num_players": self.num_players,
-            }
+            "game_id": f"spy_e{epoch}_s{sample_idx}",
+            "epoch": epoch,
+            "sample_idx": sample_idx,
+            "num_players": self.num_players,
+            "spy_player": spy_player,
+            "player_descriptions": player_descriptions,
+            "original_description": orig,
+            "modified_description": mod,
+            "diff_metadata": diff_meta,
         }
 
-    @staticmethod
-    def collate_fn(examples):
-        prompts = [ex["prompt"] for ex in examples]
-        metadatas = [ex["metadata"] for ex in examples]
-        return prompts, metadatas
+    def format_generation_prompt(self, game_data, player_id):
+        """Create image generation prompt for a player.
+
+        Spy gets modified description with stealth instruction.
+        Civilian gets original description with faithful render instruction.
+        """
+        desc = game_data["player_descriptions"][player_id - 1]
+        spy_player = game_data["spy_player"]
+
+        if player_id == spy_player:
+            role_hint = (
+                "You are the SPY. Your scene description is slightly different "
+                "from the other players'. Generate an image that looks as similar "
+                "as possible to what the original scene might look like, to avoid detection."
+            )
+        else:
+            role_hint = (
+                "You are a CIVILIAN. Generate an image that faithfully represents "
+                "the scene description. Your image should be consistent with "
+                "other civilian players' images."
+            )
+
+        return (
+            f"{role_hint}\n\n"
+            f"Generate a high-quality image of the following 3D rendered scene. "
+            f"The scene contains geometric objects (cubes, spheres, cylinders) "
+            f"with different colors, sizes, and materials on a flat surface.\n\n"
+            f"Scene: {desc}"
+        )
+
+    def format_generation_prompt_simple(self, game_data, player_id):
+        """Simple generation prompt — just the scene description."""
+        desc = game_data["player_descriptions"][player_id - 1]
+        return f"A 3D rendered scene with geometric objects on a flat surface: {desc}"
+
+    def format_voting_prompt(self, game_data, player_id=None):
+        """Create voting prompt for identifying the spy.
+
+        The voter sees all generated images as a labeled grid.
+        """
+        N = game_data["num_players"]
+
+        if player_id is None:
+            # God judge perspective
+            return (
+                f'You are analyzing a game of "Who\'s the Odd One Out?" where '
+                f'{N} players each generated an image from a scene description. '
+                f'One player (the spy) received a slightly different description, '
+                f'so their generated image should look subtly different.\n\n'
+                f'All {N} generated images are shown (labeled Player 1-{N}). '
+                f'Compare carefully and identify which player generated the odd image.\n\n'
+                f'Required output format:\n'
+                f'<think>\nYour step-by-step reasoning.\n</think>\n'
+                f'<answer>\nPLAYER_NUMBER (just the number)\n</answer>'
+            )
+
+        spy_player = game_data["spy_player"]
+        if player_id == spy_player:
+            role_info = "Your role: SPY (your description was different)"
+            instruction = (
+                "You know your image might look different. "
+                "Try to vote for someone else to avoid suspicion."
+            )
+        else:
+            role_info = "Your role: CIVILIAN (your description was the same as most)"
+            instruction = (
+                "Look for the image that seems inconsistent with the others. "
+                "Vote for the player you think is the spy."
+            )
+
+        return (
+            f'You are PLAYER {player_id} in a game of "Who\'s the Odd One Out?". '
+            f'Each player generated an image from a scene description. '
+            f'One player (the spy) had a different description.\n\n'
+            f'{role_info}\n\n'
+            f'All {N} generated images are shown. {instruction}\n\n'
+            f'Required output format:\n'
+            f'<think>\nYour step-by-step reasoning.\n</think>\n'
+            f'<answer>\nPLAYER_NUMBER or N/A\n</answer>'
+        )
+
+    def extract_vote(self, response):
+        """Extract vote from response text. Returns dict or None."""
+        # Try <answer> tags
+        m = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+        else:
+            # Try boxed format
+            m = re.search(r'\\\\?boxed\{(.*?)\}', response, re.DOTALL)
+            if m:
+                content = m.group(1).strip()
+            else:
+                return None
+
+        if content.upper() in ("N/A", "NA"):
+            return {"voted_spy": "N/A"}
+        nums = re.findall(r'\b([1-9])\b', content)
+        if nums:
+            return {"voted_spy": int(nums[0])}
+        return None
+
+    def calculate_game_rewards(self, game_data, player_votes):
+        """Calculate per-player rewards from voting. Vision-Zero formula."""
+        N = game_data["num_players"]
+        spy = game_data["spy_player"]
+        alpha, beta = 0.6, 0.5
+
+        vote_counts = {i: 0 for i in range(1, N + 1)}
+        valid_votes = []
+        for pid, vote in enumerate(player_votes, 1):
+            if vote and "voted_spy" in vote:
+                v = vote["voted_spy"]
+                if v == "N/A":
+                    valid_votes.append("N/A")
+                elif isinstance(v, int) and 1 <= v <= N:
+                    vote_counts[v] += 1
+                    valid_votes.append(v)
+                else:
+                    valid_votes.append(None)
+            else:
+                valid_votes.append(None)
+
+        rewards = {}
+        for pid in range(1, N + 1):
+            if pid == spy:
+                stealth = 1.0 - vote_counts[pid] / max(N - 1, 1)
+                mislead = sum(
+                    1.0 if v is not None and v != spy and v != "N/A"
+                    else 0.5 if v == "N/A" else 0.0
+                    for v in valid_votes
+                )
+                rewards[pid] = max(-1.0, min(1.0, stealth + beta * mislead / max(N - 1, 1)))
+            else:
+                if not player_votes[pid - 1] or "voted_spy" not in player_votes[pid - 1]:
+                    rewards[pid] = -1.0
+                    continue
+                voted = player_votes[pid - 1]["voted_spy"]
+                case = 1.0 if voted == spy else -1.0
+                suspicion = -alpha * vote_counts[pid] / max(N - 1, 1)
+                rewards[pid] = max(-1.0, min(1.0, case + suspicion))
+
+        spy_caught = vote_counts[spy] > N // 2
+        return {
+            "player_rewards": rewards,
+            "spy_caught": spy_caught,
+            "vote_counts": dict(vote_counts),
+            "spy_player": spy,
+        }
+
+    def compute_generation_rewards(self, game_outcome):
+        """Convert game outcome to per-player generation rewards for Flow-GRPO."""
+        N = len(game_outcome["player_rewards"])
+        spy = game_outcome["spy_player"]
+        caught = game_outcome["spy_caught"]
+
+        gen_rewards = []
+        for pid in range(1, N + 1):
+            if pid == spy:
+                gen_rewards.append(1.0 if not caught else -1.0)
+            else:
+                gen_rewards.append(1.0 if caught else -0.5)
+        return gen_rewards
+
+    def update_baselines(self, spy_reward, civ_avg_reward):
+        """Update EMA role baselines."""
+        self.b_spy = self.ema_alpha * self.b_spy + (1 - self.ema_alpha) * spy_reward
+        self.b_civ = self.ema_alpha * self.b_civ + (1 - self.ema_alpha) * civ_avg_reward
+        self.update_count += 1

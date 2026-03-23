@@ -407,8 +407,7 @@ def unifiedreward_score_sglang(device):
     
     return _fn
 
-def multi_score(device, score_dict, config=None):
-    from flow_grpo.spy_game_reward import spy_game_score
+def multi_score(device, score_dict):
 
     score_functions = {
         "deqa": deqa_score_remote,
@@ -423,16 +422,10 @@ def multi_score(device, score_dict, config=None):
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,
-        "spy_game": spy_game_score,
     }
     score_fns={}
     for score_name, weight in score_dict.items():
-        if score_name == "spy_game":
-            score_fns[score_name] = spy_game_score(device, config=config)
-        elif 'device' in score_functions[score_name].__code__.co_varnames:
-            score_fns[score_name] = score_functions[score_name](device)
-        else:
-            score_fns[score_name] = score_functions[score_name]()
+        score_fns[score_name] = score_functions[score_name](device) if 'device' in score_functions[score_name].__code__.co_varnames else score_functions[score_name]()
 
     # only_strict is only for geneval. During training, only the strict reward is needed, and non-strict rewards don't need to be computed, reducing reward calculation time.
     def _fn(images, prompts, metadata, ref_images=None, only_strict=True):
