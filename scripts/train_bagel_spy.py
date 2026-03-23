@@ -36,7 +36,7 @@ from flow_grpo.bagel.modeling.autoencoder import load_ae
 from flow_grpo.bagel.inferencer import InterleaveInferencer
 
 # spy game
-from flow_grpo.spy_game_data import SpyGameDataGenerator
+from flow_grpo.spy_game_data import SpyGameDataGenerator, TextFileGameDataGenerator
 from flow_grpo.spy_game_reward import (
     build_voting_grid, build_voting_grid_tensor, grid_tensor_to_pil,
     tensor_images_to_pil, run_bagel_vote, compute_group_advantages,
@@ -381,12 +381,24 @@ def main(_):
     model.language_model = transformer
 
     # ==================== GAME SETUP ====================
-    game_generator = SpyGameDataGenerator(
-        num_players=num_players,
-        num_objects_min=spy_cfg.get('num_objects_min', 3),
-        num_objects_max=spy_cfg.get('num_objects_max', 6),
-        num_to_modify=spy_cfg.get('num_to_modify', 2),
-    )
+    prompt_type = spy_cfg.get('prompt_type', 'clevr')
+    if prompt_type == 'clevr':
+        game_generator = SpyGameDataGenerator(
+            num_players=num_players,
+            num_objects_min=spy_cfg.get('num_objects_min', 3),
+            num_objects_max=spy_cfg.get('num_objects_max', 6),
+            num_to_modify=spy_cfg.get('num_to_modify', 2),
+            max_props_per_obj=spy_cfg.get('max_props_per_obj', 1),
+        )
+    else:
+        # Text-file based: ocr, geneval, pickscore
+        game_generator = TextFileGameDataGenerator(
+            dataset_path=config.dataset,
+            split='train',
+            prompt_type=prompt_type,
+            num_players=num_players,
+        )
+    logger.info(f"  Game data: prompt_type={prompt_type}")
     max_vote_tokens = spy_cfg.get('max_vote_tokens', 512)
     num_inner_epochs = config.train.num_inner_epochs
 

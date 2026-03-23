@@ -7,6 +7,8 @@ Generates CLEVR-style scene description pairs and orchestrates the
   - SPY-UMM/data/scene_description_generator.py (scene generation)
 """
 
+import json
+import os
 import random
 import re
 from typing import Dict, Any, List, Tuple, Optional
@@ -360,3 +362,240 @@ class SpyGameDataGenerator:
         self.b_spy = self.ema_alpha * self.b_spy + (1 - self.ema_alpha) * spy_reward
         self.b_civ = self.ema_alpha * self.b_civ + (1 - self.ema_alpha) * civ_avg_reward
         self.update_count += 1
+
+
+# ─── Text-file based game data generators ────────────────────────────────────
+
+# Prompt modification utilities for real-world prompts
+
+_COLOR_MAP = {
+    'red': 'blue', 'blue': 'red', 'green': 'yellow', 'yellow': 'green',
+    'white': 'black', 'black': 'white', 'pink': 'orange', 'orange': 'pink',
+    'purple': 'brown', 'brown': 'purple', 'gray': 'golden', 'golden': 'gray',
+}
+
+_SIZE_MAP = {
+    'large': 'small', 'small': 'large', 'big': 'tiny', 'tiny': 'big',
+    'tall': 'short', 'short': 'tall',
+}
+
+_COUNT_MAP = {
+    'one': 'two', 'two': 'three', 'three': 'four', 'four': 'five',
+    'five': 'six', 'six': 'seven',
+}
+
+_WORD_SWAPS = {
+    'First': 'Last', 'Last': 'First', 'Start': 'Stop', 'Stop': 'Start',
+    'Open': 'Close', 'Close': 'Open', 'Yes': 'No', 'No': 'Yes',
+    'Hot': 'Cold', 'Cold': 'Hot', 'Up': 'Down', 'Down': 'Up',
+    'Left': 'Right', 'Right': 'Left', 'New': 'Old', 'Old': 'New',
+    'Day': 'Night', 'Night': 'Day', 'Spring': 'Autumn',
+    'Active': 'Inactive', 'On': 'Off', 'Off': 'On',
+    'Food': 'Water', 'Water': 'Food',
+}
+
+_POS_MAP = {
+    'below': 'above', 'above': 'below', 'left': 'right', 'right': 'left',
+    'behind': 'in front of', 'in front of': 'behind',
+}
+
+
+def modify_ocr_prompt(prompt, rng):
+    """Modify 1-2 words inside quoted text of an OCR prompt."""
+    quoted = re.findall(r'"([^"]+)"', prompt)
+    if not quoted:
+        return modify_natural_prompt(prompt, rng)
+
+    target = rng.choice(quoted)
+    words = target.split()
+    if len(words) < 1:
+        return modify_natural_prompt(prompt, rng)
+
+    # Try semantic word swap first
+    for i, w in enumerate(words):
+        if w in _WORD_SWAPS:
+            new_words = words.copy()
+            new_words[i] = _WORD_SWAPS[w]
+            new_text = ' '.join(new_words)
+            modified = prompt.replace(f'"{target}"', f'"{new_text}"', 1)
+            return modified, f'text: "{target}"→"{new_text}"'
+
+    # Fallback: replace one random word
+    idx = rng.randint(0, len(words) - 1)
+    replacements = ['Special', 'Ultimate', 'Secret', 'Final', 'Golden', 'Ancient']
+    old_word = words[idx]
+    new_words = words.copy()
+    new_words[idx] = rng.choice(replacements)
+    new_text = ' '.join(new_words)
+    modified = prompt.replace(f'"{target}"', f'"{new_text}"', 1)
+    return modified, f'text word: "{old_word}"→"{new_words[idx]}"'
+
+
+def modify_natural_prompt(prompt, rng):
+    """Modify a natural-language prompt: swap color, size, count, or add detail."""
+    # Try color swap
+    colors_found = [c for c in _COLOR_MAP if re.search(r'\b' + c + r'\b', prompt, re.I)]
+    if colors_found:
+        old = rng.choice(colors_found)
+        new = _COLOR_MAP[old]
+        modified = re.sub(r'\b' + old + r'\b', new, prompt, count=1, flags=re.I)
+        return modified, f"color: {old}→{new}"
+
+    # Try size swap
+    sizes_found = [s for s in _SIZE_MAP if re.search(r'\b' + s + r'\b', prompt, re.I)]
+    if sizes_found:
+        old = rng.choice(sizes_found)
+        new = _SIZE_MAP[old]
+        modified = re.sub(r'\b' + old + r'\b', new, prompt, count=1, flags=re.I)
+        return modified, f"size: {old}→{new}"
+
+    # Try count swap
+    for old, new in _COUNT_MAP.items():
+        if re.search(r'\b' + old + r'\b', prompt, re.I):
+            modified = re.sub(r'\b' + old + r'\b', new, prompt, count=1, flags=re.I)
+            return modified, f"count: {old}→{new}"
+
+    # Fallback: append detail
+    extras = ["with a small red ball", "near a wooden fence", "under a cloudy sky",
+              "next to a blue car", "beside a green tree"]
+    extra = rng.choice(extras)
+    modified = prompt.rstrip('.') + f", {extra}."
+    return modified, f"added: {extra}"
+
+
+def modify_geneval_prompt(prompt, metadata, rng):
+    """Modify a geneval prompt based on its tag (color/count/position/two_object)."""
+    tag = metadata.get('tag', '')
+
+    if tag in ('color_attr', 'colors'):
+        colors = [c for c in _COLOR_MAP if c in prompt.lower()]
+        if colors:
+            old = rng.choice(colors)
+            new = _COLOR_MAP[old]
+            return prompt.replace(old, new, 1), f"color: {old}→{new}"
+
+    if tag == 'counting':
+        for old, new in _COUNT_MAP.items():
+            if re.search(r'\b' + old + r'\b', prompt, re.I):
+                modified = re.sub(r'\b' + old + r'\b', new, prompt, count=1, flags=re.I)
+                return modified, f"count: {old}→{new}"
+
+    if tag == 'position':
+        for old, new in _POS_MAP.items():
+            if old in prompt.lower():
+                modified = prompt.lower().replace(old, new, 1)
+                modified = prompt[0] + modified[1:]
+                return modified, f"position: {old}→{new}"
+
+    if tag == 'two_object':
+        includes = metadata.get('include', [])
+        if len(includes) >= 2:
+            a, b = includes[0]['class'], includes[1]['class']
+            if a in prompt and b in prompt:
+                modified = prompt.replace(a, '__T__', 1).replace(b, a, 1).replace('__T__', b, 1)
+                return modified, f"swap: {a}↔{b}"
+
+    return modify_natural_prompt(prompt, rng)
+
+
+class TextFileGameDataGenerator(SpyGameDataGenerator):
+    """Game data generator that loads prompts from a text file.
+
+    Each line in the file is a prompt. The spy's prompt is created by
+    automatically modifying the original prompt (swap color/size/count/text).
+
+    Supports:
+      - OCR prompts (modifies quoted text)
+      - Geneval prompts (modifies based on tag metadata)
+      - Natural prompts (modifies colors/sizes/counts)
+    """
+
+    def __init__(self, dataset_path, split='train', prompt_type='ocr',
+                 num_players=4):
+        super().__init__(num_players=num_players)
+        self.prompt_type = prompt_type
+        self.prompts = []
+        self.metadatas = []
+
+        if prompt_type == 'ocr':
+            txt_path = os.path.join(dataset_path, f'{split}.txt')
+            with open(txt_path, 'r') as f:
+                self.prompts = [line.strip() for line in f if len(line.strip()) > 20]
+        elif prompt_type == 'geneval':
+            jsonl_path = os.path.join(dataset_path, f'{split}_metadata.jsonl')
+            import json
+            with open(jsonl_path, 'r') as f:
+                for line in f:
+                    data = json.loads(line)
+                    self.prompts.append(data['prompt'])
+                    self.metadatas.append(data)
+        elif prompt_type == 'pickscore':
+            txt_path = os.path.join(dataset_path, f'{split}.txt')
+            with open(txt_path, 'r') as f:
+                self.prompts = [line.strip() for line in f if len(line.strip()) > 20]
+        else:
+            raise ValueError(f"Unknown prompt_type: {prompt_type}")
+
+    def generate_game(self, epoch, sample_idx):
+        """Generate a game from the loaded prompt file."""
+        rng = random.Random(epoch * 10000 + sample_idx)
+
+        # Pick a prompt
+        idx = rng.randint(0, len(self.prompts) - 1)
+        orig = self.prompts[idx]
+
+        # Create modified version
+        if self.prompt_type == 'ocr':
+            mod, change_desc = modify_ocr_prompt(orig, rng)
+        elif self.prompt_type == 'geneval':
+            meta = self.metadatas[idx] if idx < len(self.metadatas) else {}
+            mod, change_desc = modify_geneval_prompt(orig, meta, rng)
+        else:
+            mod, change_desc = modify_natural_prompt(orig, rng)
+
+        # Assign spy
+        spy_player = rng.randint(1, self.num_players)
+
+        player_descriptions = []
+        for pid in range(1, self.num_players + 1):
+            player_descriptions.append(mod if pid == spy_player else orig)
+
+        return {
+            "game_id": f"spy_e{epoch}_s{sample_idx}",
+            "epoch": epoch,
+            "sample_idx": sample_idx,
+            "num_players": self.num_players,
+            "spy_player": spy_player,
+            "player_descriptions": player_descriptions,
+            "original_description": orig,
+            "modified_description": mod,
+            "diff_metadata": {"change": change_desc, "prompt_type": self.prompt_type},
+        }
+
+    def format_generation_prompt(self, game_data, player_id):
+        """Generation prompt for text-file based games (no CLEVR-specific wording)."""
+        desc = game_data["player_descriptions"][player_id - 1]
+        spy_player = game_data["spy_player"]
+        N = game_data["num_players"]
+
+        if player_id == spy_player:
+            role_hint = (
+                f"You are PLAYER {player_id} of {N} in a game of \"Who's the Odd One Out?\". "
+                f"Your role: SPY. Your prompt is slightly different from the other players'. "
+                f"Generate an image that looks as similar as possible to what the others "
+                f"might generate, to avoid detection."
+            )
+        else:
+            role_hint = (
+                f"You are PLAYER {player_id} of {N} in a game of \"Who's the Odd One Out?\". "
+                f"Your role: CIVILIAN. Generate an image that faithfully represents "
+                f"the description. Your image should be consistent with other players'."
+            )
+
+        return f"{role_hint}\n\n{desc}"
+
+    def format_generation_prompt_simple(self, game_data, player_id):
+        """Simple prompt with player identity."""
+        desc = game_data["player_descriptions"][player_id - 1]
+        N = game_data["num_players"]
+        return f"You are Player {player_id} of {N}. {desc}"

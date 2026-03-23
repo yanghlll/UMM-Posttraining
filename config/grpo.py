@@ -1080,5 +1080,35 @@ def spy_game_bagel_lora():
     return config
 
 
+def spy_game_bagel_ocr():
+    """Bagel training with spy-civ self-play on OCR text rendering data."""
+    config = spy_game_bagel()
+    config.run_name = "[bagel-spy-ocr]-4gpu"
+    config.dataset = os.path.join(os.getcwd(), "dataset/ocr")
+    config.spy_game.prompt_type = "ocr"  # use TextFileGameDataGenerator
+    config.save_dir = 'logs/spy_game/bagel_ocr'
+    return config
+
+
+def spy_game_bagel_geneval():
+    """Bagel training with spy-civ self-play on geneval compositional data."""
+    config = spy_game_bagel()
+    config.run_name = "[bagel-spy-geneval]-4gpu"
+    config.dataset = os.path.join(os.getcwd(), "dataset/geneval")
+    config.spy_game.prompt_type = "geneval"
+    config.save_dir = 'logs/spy_game/bagel_geneval'
+    return config
+
+
+def spy_game_bagel_pickscore():
+    """Bagel training with spy-civ self-play on pickscore natural scene data."""
+    config = spy_game_bagel()
+    config.run_name = "[bagel-spy-pickscore]-4gpu"
+    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
+    config.spy_game.prompt_type = "pickscore"
+    config.save_dir = 'logs/spy_game/bagel_pickscore'
+    return config
+
+
 def get_config(name):
     return globals()[name]()
