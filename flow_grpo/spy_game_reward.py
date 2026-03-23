@@ -2,76 +2,91 @@
 Spy Game Reward Utilities for Flow-GRPO Bagel Training.
 
 Provides voting grid construction and Bagel understanding-mode voting,
-adapated from SPY-UMM/models/showo2_spy_wrapper.py:judge_vote().
+adapted from SPY-UMM/models/showo2_spy_wrapper.py:judge_vote().
 """
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
-from typing import List
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
+from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 
-def build_voting_grid(pil_images: List[Image.Image], cell_size: int = 256) -> Image.Image:
-    """Build a labeled grid of player images for voting.
+# ─── Tensor-native voting grid (avoids GPU→CPU→PIL→CPU round-trip) ───────────
 
-    Creates a 2×2 (or appropriate) grid with player labels,
-    similar to showo2_spy_wrapper.py:486-515.
+def build_voting_grid_tensor(image_tensors: List[torch.Tensor],
+                              cell_size: int = 256) -> torch.Tensor:
+    """Build a voting grid directly from GPU tensors. No PIL needed.
 
     Args:
-        pil_images: List of PIL images, one per player.
-        cell_size: Size of each cell in the grid.
+        image_tensors: List of [3,H,W] tensors on GPU, values in [0,1].
+        cell_size: Target size per cell.
 
     Returns:
-        Single PIL image containing all players' images in a labeled grid.
+        Single [3, grid_H, grid_W] tensor on same device.
     """
-    N = len(pil_images)
+    N = len(image_tensors)
     cols = min(N, 2)
     rows = (N + cols - 1) // cols
-    grid_w = cols * cell_size
-    grid_h = rows * (cell_size + 20)  # 20px for label
+    device = image_tensors[0].device
 
-    grid = Image.new('RGB', (grid_w, grid_h), (200, 200, 200))
-    draw = ImageDraw.Draw(grid)
+    # Resize all images to cell_size in one batch (GPU-accelerated)
+    stacked = torch.stack(image_tensors)  # [N, 3, H, W]
+    resized = F.interpolate(stacked, size=(cell_size, cell_size),
+                            mode='bilinear', align_corners=False)  # [N, 3, cs, cs]
 
-    for idx, img in enumerate(pil_images):
+    # Build grid on GPU
+    grid = torch.full((3, rows * cell_size, cols * cell_size), 0.78,
+                       device=device, dtype=resized.dtype)  # gray bg
+    for idx in range(N):
         r, c = divmod(idx, cols)
-        x = c * cell_size
-        y = r * (cell_size + 20)
-
-        # Draw label
-        label = f"Player {idx + 1}"
-        draw.text((x + 5, y + 2), label, fill=(0, 0, 0))
-
-        # Paste resized image
-        resized = img.resize((cell_size, cell_size))
-        grid.paste(resized, (x, y + 20))
+        y, x = r * cell_size, c * cell_size
+        grid[:, y:y + cell_size, x:x + cell_size] = resized[idx]
 
     return grid
 
 
+def grid_tensor_to_pil(grid_tensor: torch.Tensor) -> Image.Image:
+    """Convert a single [3,H,W] tensor to PIL. Lightweight, for voting input."""
+    img = (grid_tensor * 255).round().clamp(0, 255).to(torch.uint8).cpu()
+    return Image.fromarray(img.permute(1, 2, 0).numpy())
+
+
+# ─── Legacy PIL-based grid (for logging only) ────────────────────────────────
+
+def build_voting_grid(pil_images: List[Image.Image], cell_size: int = 256) -> Image.Image:
+    """Build a labeled grid from PIL images. Used for wandb logging."""
+    N = len(pil_images)
+    cols = min(N, 2)
+    rows = (N + cols - 1) // cols
+    grid_w = cols * cell_size
+    grid_h = rows * (cell_size + 20)
+    grid = Image.new('RGB', (grid_w, grid_h), (200, 200, 200))
+    draw = ImageDraw.Draw(grid)
+    for idx, img in enumerate(pil_images):
+        r, c = divmod(idx, cols)
+        x = c * cell_size
+        y = r * (cell_size + 20)
+        draw.text((x + 5, y + 2), f"Player {idx + 1}", fill=(0, 0, 0))
+        grid.paste(img.resize((cell_size, cell_size)), (x, y + 20))
+    return grid
+
+
 def tensor_images_to_pil(images: torch.Tensor) -> List[Image.Image]:
-    """Convert batch of tensor images [N,3,H,W] in [0,1] to PIL images."""
+    """Convert batch [N,3,H,W] in [0,1] to PIL. Only for logging."""
     if images.dim() == 3:
         images = images.unsqueeze(0)
     imgs = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-    imgs = imgs.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+    imgs = imgs.transpose(0, 2, 3, 1)
     return [Image.fromarray(img) for img in imgs]
 
 
+# ─── Voting ──────────────────────────────────────────────────────────────────
+
 def run_bagel_vote(inferencer, grid_image: Image.Image, vote_prompt: str,
                    max_tokens: int = 512, temperature: float = 0.7) -> str:
-    """Run Bagel in understanding mode to vote on a grid image.
-
-    Args:
-        inferencer: Bagel InterleaveInferencer instance.
-        grid_image: Grid image showing all players' generated images.
-        vote_prompt: Voting prompt text.
-        max_tokens: Max tokens for vote response.
-        temperature: Sampling temperature.
-
-    Returns:
-        Generated vote text.
-    """
+    """Run Bagel understanding mode to vote on a grid image."""
     output = inferencer.interleave_inference(
         input_lists=[grid_image, vote_prompt],
         understanding_output=True,
@@ -79,11 +94,12 @@ def run_bagel_vote(inferencer, grid_image: Image.Image, vote_prompt: str,
         text_temperature=temperature,
         max_think_token_n=max_tokens,
     )
-    # interleave_inference returns a list; take the text output
     if isinstance(output, list) and len(output) > 0:
         return output[0]
     return str(output)
 
+
+# ─── Advantages ──────────────────────────────────────────────────────────────
 
 def compute_group_advantages(flat_rewards: List[float], eps: float = 1e-4) -> torch.Tensor:
     """Compute group-relative advantages from flat reward list."""

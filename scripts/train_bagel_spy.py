@@ -39,8 +39,8 @@ from flow_grpo.bagel.inferencer import InterleaveInferencer
 # spy game
 from flow_grpo.spy_game_data import SpyGameDataGenerator
 from flow_grpo.spy_game_reward import (
-    build_voting_grid, tensor_images_to_pil, run_bagel_vote,
-    compute_group_advantages,
+    build_voting_grid, build_voting_grid_tensor, grid_tensor_to_pil,
+    tensor_images_to_pil, run_bagel_vote, compute_group_advantages,
 )
 
 import numpy as np
@@ -57,107 +57,110 @@ from flow_grpo.fsdp_utils import save_fsdp_checkpoint
 from huggingface_hub import snapshot_download
 
 
-# ─── Image diversity metrics ─────────────────────────────────────────────────
+# ─── Image diversity metrics (GPU-native, single sync) ──────────────────────
 
 @torch.no_grad()
 def compute_image_diversity_metrics(player_images_tensor: list) -> dict:
-    """Compute diversity metrics across player-generated images within a game.
-
-    Detects mode collapse / over-similarity between players' outputs.
-
-    Args:
-        player_images_tensor: List of [3,H,W] tensors (one per player).
-
-    Returns:
-        Dict of diversity metrics.
-    """
+    """Compute diversity metrics entirely on GPU, sync once at end."""
     if len(player_images_tensor) < 2:
         return {}
 
-    images = torch.stack(player_images_tensor)  # [N, 3, H, W]
+    images = torch.stack(player_images_tensor).float()  # [N, 3, H, W]
     N = images.shape[0]
+    flat = images.reshape(N, -1)  # [N, D]
 
-    # 1. Pixel-level pairwise MSE (higher = more diverse)
-    flat = images.reshape(N, -1).float()
-    pairwise_mse = []
-    for i in range(N):
-        for j in range(i + 1, N):
-            pairwise_mse.append(F.mse_loss(flat[i], flat[j]).item())
-    mean_pairwise_mse = np.mean(pairwise_mse) if pairwise_mse else 0.0
+    # All pairwise: use matrix operations instead of loops
+    # Pairwise MSE via ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>
+    sq_norms = (flat ** 2).sum(dim=1)  # [N]
+    dots = flat @ flat.T  # [N, N]
+    pairwise_sq_diff = sq_norms.unsqueeze(1) + sq_norms.unsqueeze(0) - 2 * dots  # [N, N]
+    D = flat.shape[1]
+    # Extract upper triangle (excluding diagonal)
+    mask = torch.triu(torch.ones(N, N, device=flat.device, dtype=torch.bool), diagonal=1)
+    mean_pairwise_mse = (pairwise_sq_diff[mask] / D).mean()
 
-    # 2. Per-pixel std across players (higher = more diverse)
-    pixel_std = images.float().std(dim=0).mean().item()
+    # Per-pixel std
+    pixel_std = images.std(dim=0).mean()
 
-    # 3. Mean cosine similarity (lower = more diverse, 1.0 = identical)
+    # Cosine similarity via normalized dot product matrix
     norms = flat / (flat.norm(dim=1, keepdim=True) + 1e-8)
-    cosine_sims = []
-    for i in range(N):
-        for j in range(i + 1, N):
-            cosine_sims.append((norms[i] * norms[j]).sum().item())
-    mean_cosine_sim = np.mean(cosine_sims) if cosine_sims else 0.0
+    cos_matrix = norms @ norms.T  # [N, N]
+    mean_cosine_sim = cos_matrix[mask].mean()
 
-    # 4. Histogram intersection (color distribution similarity)
-    hist_sims = []
+    # Histogram intersection: batch all pairs
+    gray = images.mean(dim=1).reshape(N, -1)  # [N, H*W]
+    # Vectorized histc: bin each image
+    bins = 64
+    hist_all = torch.zeros(N, bins, device=flat.device)
+    for i in range(N):
+        hist_all[i] = torch.histc(gray[i], bins=bins, min=0.0, max=1.0)
+    hist_all = hist_all / (hist_all.sum(dim=1, keepdim=True) + 1e-8)
+    # Pairwise intersection
+    hist_intersections = []
     for i in range(N):
         for j in range(i + 1, N):
-            img_i = images[i].float().mean(dim=0).flatten()  # grayscale
-            img_j = images[j].float().mean(dim=0).flatten()
-            # Normalize to histogram-like distribution
-            h_i = torch.histc(img_i, bins=64, min=0.0, max=1.0)
-            h_j = torch.histc(img_j, bins=64, min=0.0, max=1.0)
-            h_i = h_i / (h_i.sum() + 1e-8)
-            h_j = h_j / (h_j.sum() + 1e-8)
-            intersection = torch.minimum(h_i, h_j).sum().item()
-            hist_sims.append(intersection)
-    mean_hist_sim = np.mean(hist_sims) if hist_sims else 0.0
+            hist_intersections.append(torch.minimum(hist_all[i], hist_all[j]).sum())
+    mean_hist_sim = torch.stack(hist_intersections).mean()
+
+    # Single GPU→CPU sync for all 4 metrics
+    results = torch.stack([mean_pairwise_mse, pixel_std, mean_cosine_sim, mean_hist_sim])
+    r = results.cpu().numpy()
 
     return {
-        "img_pairwise_mse": mean_pairwise_mse,
-        "img_pixel_std": pixel_std,
-        "img_cosine_sim": mean_cosine_sim,
-        "img_hist_sim": mean_hist_sim,
+        "img_pairwise_mse": float(r[0]),
+        "img_pixel_std": float(r[1]),
+        "img_cosine_sim": float(r[2]),
+        "img_hist_sim": float(r[3]),
     }
 
 
+@torch.no_grad()
 def compute_spy_vs_civ_divergence(player_images_tensor: list,
                                    spy_idx: int) -> dict:
-    """Compute how different the spy's image is from civilian images.
-
-    Args:
-        player_images_tensor: List of [3,H,W] tensors.
-        spy_idx: 0-indexed spy player index.
-
-    Returns:
-        Dict with spy-vs-civilian divergence metrics.
-    """
+    """Compute spy-vs-civilian divergence on GPU, single sync."""
     if len(player_images_tensor) < 2:
         return {}
 
-    spy_img = player_images_tensor[spy_idx].reshape(-1).float()
-    civ_imgs = [player_images_tensor[i].reshape(-1).float()
-                for i in range(len(player_images_tensor)) if i != spy_idx]
+    images = torch.stack(player_images_tensor).float()  # [N, 3, H, W]
+    N = images.shape[0]
+    flat = images.reshape(N, -1)  # [N, D]
+    D = flat.shape[1]
 
-    # MSE: spy vs each civilian
-    spy_civ_mses = [F.mse_loss(spy_img, c).item() for c in civ_imgs]
+    spy_flat = flat[spy_idx]  # [D]
+    civ_mask = torch.arange(N, device=flat.device) != spy_idx
+    civ_flat = flat[civ_mask]  # [N-1, D]
 
-    # MSE: civilian vs civilian
-    civ_civ_mses = []
-    for i in range(len(civ_imgs)):
-        for j in range(i + 1, len(civ_imgs)):
-            civ_civ_mses.append(F.mse_loss(civ_imgs[i], civ_imgs[j]).item())
+    # Spy vs each civilian MSE
+    spy_civ_mse = ((spy_flat.unsqueeze(0) - civ_flat) ** 2).mean(dim=1)  # [N-1]
+    mean_spy_civ_mse = spy_civ_mse.mean()
 
-    # Cosine sim: spy vs civilian mean
-    civ_mean = torch.stack(civ_imgs).mean(dim=0)
-    spy_norm = spy_img / (spy_img.norm() + 1e-8)
-    civ_norm = civ_mean / (civ_mean.norm() + 1e-8)
-    spy_civ_cosine = (spy_norm * civ_norm).sum().item()
+    # Civilian vs civilian MSE
+    Nc = civ_flat.shape[0]
+    if Nc >= 2:
+        civ_sq = (civ_flat ** 2).sum(dim=1)
+        civ_dots = civ_flat @ civ_flat.T
+        civ_pw = civ_sq.unsqueeze(1) + civ_sq.unsqueeze(0) - 2 * civ_dots
+        civ_mask_tri = torch.triu(torch.ones(Nc, Nc, device=flat.device, dtype=torch.bool), diagonal=1)
+        mean_civ_civ_mse = (civ_pw[civ_mask_tri] / D).mean()
+    else:
+        mean_civ_civ_mse = torch.tensor(0.0, device=flat.device)
+
+    # Ratio
+    mse_ratio = mean_spy_civ_mse / (mean_civ_civ_mse + 1e-8)
+
+    # Cosine: spy vs civilian mean
+    civ_mean = civ_flat.mean(dim=0)
+    cos_sim = F.cosine_similarity(spy_flat.unsqueeze(0), civ_mean.unsqueeze(0))
+
+    # Single sync
+    results = torch.stack([mean_spy_civ_mse, mean_civ_civ_mse, mse_ratio, cos_sim.squeeze()])
+    r = results.cpu().numpy()
 
     return {
-        "spy_vs_civ_mse": np.mean(spy_civ_mses),
-        "civ_vs_civ_mse": np.mean(civ_civ_mses) if civ_civ_mses else 0.0,
-        "spy_civ_mse_ratio": (np.mean(spy_civ_mses) / (np.mean(civ_civ_mses) + 1e-8))
-            if civ_civ_mses else 0.0,
-        "spy_vs_civ_cosine": spy_civ_cosine,
+        "spy_vs_civ_mse": float(r[0]),
+        "civ_vs_civ_mse": float(r[1]),
+        "spy_civ_mse_ratio": float(r[2]),
+        "spy_vs_civ_cosine": float(r[3]),
     }
 
 
@@ -246,8 +249,9 @@ def main(_):
         project_config=accelerator_config,
         gradient_accumulation_steps=grad_accum,
     )
-    accelerator.state.fsdp_plugin.activation_checkpointing = config.activation_checkpointing
-    accelerator.state.fsdp_plugin.transformer_cls_names_to_wrap = ['Qwen2MoTDecoderLayer']
+    if hasattr(accelerator.state, 'fsdp_plugin') and accelerator.state.fsdp_plugin is not None:
+        accelerator.state.fsdp_plugin.activation_checkpointing = config.activation_checkpointing
+        accelerator.state.fsdp_plugin.transformer_cls_names_to_wrap = ['Qwen2MoTDecoderLayer']
 
     if accelerator.is_main_process:
         wandb.init(project="flow_grpo_spy", name=config.run_name, config=config.to_dict())
@@ -362,6 +366,8 @@ def main(_):
 
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     optimizer = torch.optim.AdamW(
         transformer_trainable_parameters,
@@ -412,13 +418,13 @@ def main(_):
         transformer.eval()
         all_game_trajs = []       # [G][N] each is dict with latents, log_probs, etc.
         all_game_rewards = []     # [G] each is list of N rewards
-        all_game_images = []      # [G][N] PIL images for logging
-        all_game_images_t = []    # [G][N] tensor images for metrics
+        all_game_images_t = []    # [G][N] tensor images (stay on GPU)
         all_game_votes = []       # [G][N] vote dicts for vote stats
         all_game_data_list = []   # [G] game_data dicts for analysis
         all_game_outcomes = []    # [G] game outcome dicts
         epoch_spy_rewards = []
         epoch_civ_rewards = []
+        t_gen_total, t_vote_total = 0.0, 0.0
 
         for g in tqdm(range(G), desc=f"Epoch {epoch}: games",
                       disable=not accelerator.is_local_main_process):
@@ -430,6 +436,7 @@ def main(_):
             ]
 
             # ── Phase 1: Each player generates an image ──────────
+            t_gen_start = time.time()
             player_trajs = []
             player_images_tensor = []
 
@@ -453,22 +460,27 @@ def main(_):
                     })
                     player_images_tensor.append(output_dict['image'])
 
-            # Convert to PIL for voting grid
-            pil_images = tensor_images_to_pil(torch.stack(player_images_tensor))
+            t_gen_total += time.time() - t_gen_start
+
+            # Build voting grid on GPU (no CPU transfer), convert to PIL once
+            t_vote_start = time.time()
+            grid_tensor = build_voting_grid_tensor(player_images_tensor,
+                                                    cell_size=config.resolution)
+            grid_pil = grid_tensor_to_pil(grid_tensor)  # single GPU→CPU transfer
 
             # ── Phase 2: Voting (Bagel understanding mode) ───────
-            grid_image = build_voting_grid(pil_images, cell_size=config.resolution)
             game_votes = []
-
             with torch.no_grad():
                 for pid in range(1, num_players + 1):
                     vote_prompt = game_generator.format_voting_prompt(game_data, player_id=pid)
                     vote_text = run_bagel_vote(
-                        inferencer, grid_image, vote_prompt,
+                        inferencer, grid_pil, vote_prompt,
                         max_tokens=max_vote_tokens,
                     )
                     vote_info = game_generator.extract_vote(vote_text)
                     game_votes.append(vote_info)
+
+            t_vote_total += time.time() - t_vote_start
 
             # ── Phase 3: Compute rewards ─────────────────────────
             game_outcome = game_generator.calculate_game_rewards(game_data, game_votes)
@@ -492,8 +504,7 @@ def main(_):
 
             all_game_trajs.append(player_trajs)
             all_game_rewards.append(gen_rewards)
-            all_game_images.append(pil_images)
-            all_game_images_t.append(player_images_tensor)
+            all_game_images_t.append(player_images_tensor)  # keep tensors on GPU
             all_game_votes.append(game_votes)
             all_game_data_list.append(game_data)
             all_game_outcomes.append(game_outcome)
@@ -551,10 +562,15 @@ def main(_):
             diversity_metrics = {k: np.mean(v) for k, v in diversity_metrics_accum.items()}
             spy_div_metrics = {k: np.mean(v) for k, v in spy_div_metrics_accum.items()}
 
-            # === Timing ===
+            # === Timing (per-phase breakdown) ===
             timing_metrics = {
                 "batch_time": batch_time,
                 "games_per_sec": G / max(batch_time, 0.01),
+                "time_generation": t_gen_total,
+                "time_voting": t_vote_total,
+                "time_other": batch_time - t_gen_total - t_vote_total,
+                "pct_generation": t_gen_total / max(batch_time, 0.01) * 100,
+                "pct_voting": t_vote_total / max(batch_time, 0.01) * 100,
             }
 
             # Merge all and log
@@ -575,12 +591,13 @@ def main(_):
                 f"{batch_time:.1f}s"
             )
 
-            # Log sample images every 5 epochs
-            if epoch % 5 == 0 and all_game_images:
+            # Log sample images every 5 epochs (only convert to PIL here)
+            if epoch % 5 == 0 and all_game_images_t:
+                pil_for_log = tensor_images_to_pil(torch.stack(all_game_images_t[0]))
                 with tempfile.TemporaryDirectory() as tmpdir:
                     imgs_to_log = []
                     gd = all_game_data_list[0]
-                    for pid, img in enumerate(all_game_images[0]):
+                    for pid, img in enumerate(pil_for_log):
                         path = os.path.join(tmpdir, f"p{pid+1}.jpg")
                         img.save(path)
                         is_spy = "SPY" if pid + 1 == gd['spy_player'] else "CIV"
@@ -590,37 +607,45 @@ def main(_):
                         imgs_to_log.append(wandb.Image(
                             path,
                             caption=f"P{pid+1}({is_spy}) R={reward:.2f} Vote={vote_str}"))
-                    # Also log the voting grid
                     grid_path = os.path.join(tmpdir, "grid.jpg")
-                    build_voting_grid(all_game_images[0], cell_size=config.resolution).save(grid_path)
+                    build_voting_grid(pil_for_log, cell_size=config.resolution).save(grid_path)
                     imgs_to_log.append(wandb.Image(grid_path, caption="Voting Grid"))
                     wandb.log({"game_images": imgs_to_log}, step=global_step)
 
         # ── Training: per-player per-SDE-step backward ───────────
         transformer.train()
         # Set internal training flags correctly for Bagel
-        transformer.module.training = False
-        transformer.module.model.training = False
+        # Use unwrap_model to handle both single-GPU and FSDP cases
+        unwrapped = accelerator.unwrap_model(transformer)
+        unwrapped.training = False
+        unwrapped.model.training = False
         if config.use_lora:
-            transformer.module.model.model.training = False
-            for layer in transformer.module.model.model.layers:
-                layer.module.training = False
-                layer.module.self_attn.training = False
+            unwrapped.model.model.training = False
+            for layer in unwrapped.model.model.layers:
+                layer.training = False
+                if hasattr(layer, 'self_attn'):
+                    layer.self_attn.training = False
         else:
-            for layer in transformer.module.model.layers:
-                layer.module.training = False
-                layer.module.self_attn.training = False
+            for layer in unwrapped.model.layers:
+                layer.training = False
+                if hasattr(layer, 'self_attn'):
+                    layer.self_attn.training = False
 
         info = defaultdict(list)
+
+        # Pre-compute prompts for training (reuse from sampling, avoid recomputation)
+        all_game_prompts = []
+        for g in range(G):
+            gd = all_game_data_list[g]
+            all_game_prompts.append([
+                game_generator.format_generation_prompt_simple(gd, pid)
+                for pid in range(1, num_players + 1)
+            ])
 
         for inner_epoch in range(num_inner_epochs):
             adv_idx = 0
             for g in range(G):
-                game_data = game_generator.generate_game(epoch * G + g, global_step)
-                prompts = [
-                    game_generator.format_generation_prompt_simple(game_data, pid)
-                    for pid in range(1, num_players + 1)
-                ]
+                prompts = all_game_prompts[g]
 
                 for pid in range(num_players):
                     ptraj = all_game_trajs[g][pid]
