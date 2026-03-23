@@ -228,11 +228,18 @@ def main(_):
         total_limit=config.num_checkpoint_limit,
     )
 
-    # For spy game: gradient_accumulation = G * N * sde_window_size
+    # For spy game: gradient_accumulation matches train_bagel.py pattern
+    # Each call to inferencer(learn=True) internally does sde_window_size backward+step calls.
+    # We want one real optimizer update per: G games × N players × num_inner_epochs
+    # (matching SPY-UMM: all player trajectories across all games accumulated before update)
     spy_cfg = config.spy_game
     num_players = spy_cfg.num_players
     G = spy_cfg.group_size
-    grad_accum = G * num_players * config.sample.sde_window_size
+    num_inner_epochs = config.train.num_inner_epochs
+
+    # grad_accum = total backward calls per real optimizer step
+    # = G games × N players × sde_window_size (per-SDE-step backward inside generate_image_learn)
+    grad_accum = config.train.gradient_accumulation_steps * num_players * config.sample.sde_window_size
 
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
@@ -382,6 +389,13 @@ def main(_):
     # ==================== TRAINING LOOP ====================
     logger.info("***** Running Bagel Spy-Civ Flow-GRPO Training *****")
     logger.info(f"  Players={num_players}, G={G}, inner_epochs={num_inner_epochs}")
+    logger.info(f"  SDE window={config.sample.sde_window_size}")
+    logger.info(f"  Gradient accumulation steps (Accelerator)={grad_accum}")
+    logger.info(f"    = {config.train.gradient_accumulation_steps}(config) "
+                f"x {num_players}(players) x {config.sample.sde_window_size}(sde)")
+    logger.info(f"  Backward calls per real optimizer step: {grad_accum}")
+    logger.info(f"  Total trajectories per epoch: {G * num_players} "
+                f"({G} games x {num_players} players)")
 
     global_step = 0
     spy_caught_count = 0

@@ -1047,7 +1047,9 @@ def spy_game_bagel():
     config.train.learning_rate = 1e-4
     config.train.cfg = True
     config.train.ema = False
-    config.train.gradient_accumulation_steps = 1  # handled in script
+    # gradient_accumulation_steps: multiplied by N_players * sde_window in script
+    # Effective: G * N * sde_window = 4 * 4 * 3 = 48 backward calls per real update
+    config.train.gradient_accumulation_steps = 4  # = G games accumulated
 
     # Spy game config (no external VLM — Bagel self-votes)
     config.spy_game = ml_collections.ConfigDict()
