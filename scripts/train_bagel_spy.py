@@ -17,7 +17,6 @@ import contextlib
 import os
 import datetime
 import time
-import hashlib
 from absl import app, flags
 from ml_collections import config_flags
 from accelerate import Accelerator, load_checkpoint_and_dispatch, init_empty_weights
@@ -50,7 +49,6 @@ import wandb
 from functools import partial
 import tqdm
 import tempfile
-import time
 from PIL import Image
 from peft import LoraConfig, get_peft_model
 from flow_grpo.fsdp_utils import save_fsdp_checkpoint
@@ -466,7 +464,8 @@ def main(_):
             t_vote_start = time.time()
             grid_tensor = build_voting_grid_tensor(player_images_tensor,
                                                     cell_size=config.resolution)
-            grid_pil = grid_tensor_to_pil(grid_tensor)  # single GPU→CPU transfer
+            grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
+                                           cell_size=config.resolution)
 
             # ── Phase 2: Voting (Bagel understanding mode) ───────
             game_votes = []

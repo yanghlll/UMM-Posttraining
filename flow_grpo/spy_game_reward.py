@@ -9,8 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
-from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor
+from typing import List
 
 
 # ─── Tensor-native voting grid (avoids GPU→CPU→PIL→CPU round-trip) ───────────
@@ -47,10 +46,29 @@ def build_voting_grid_tensor(image_tensors: List[torch.Tensor],
     return grid
 
 
-def grid_tensor_to_pil(grid_tensor: torch.Tensor) -> Image.Image:
-    """Convert a single [3,H,W] tensor to PIL. Lightweight, for voting input."""
+def grid_tensor_to_pil(grid_tensor: torch.Tensor,
+                       num_players: int = 0,
+                       cell_size: int = 256) -> Image.Image:
+    """Convert grid tensor to PIL and add player labels.
+
+    Args:
+        grid_tensor: [3, H, W] tensor from build_voting_grid_tensor.
+        num_players: If > 0, draw "Player N" labels on each cell.
+        cell_size: Cell size used in grid construction (for label placement).
+    """
     img = (grid_tensor * 255).round().clamp(0, 255).to(torch.uint8).cpu()
-    return Image.fromarray(img.permute(1, 2, 0).numpy())
+    pil = Image.fromarray(img.permute(1, 2, 0).numpy())
+
+    if num_players > 0:
+        draw = ImageDraw.Draw(pil)
+        cols = min(num_players, 2)
+        for idx in range(num_players):
+            r, c = divmod(idx, cols)
+            x = c * cell_size + 5
+            y = r * cell_size + 2
+            draw.text((x, y), f"Player {idx + 1}", fill=(255, 0, 0))
+
+    return pil
 
 
 # ─── Legacy PIL-based grid (for logging only) ────────────────────────────────
