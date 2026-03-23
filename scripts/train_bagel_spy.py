@@ -399,8 +399,10 @@ def main(_):
             num_players=num_players,
         )
     logger.info(f"  Game data: prompt_type={prompt_type}")
+    logger.info(f"  Role advantage: {'ENABLED' if use_role_advantage else 'DISABLED'}")
     max_vote_tokens = spy_cfg.get('max_vote_tokens', 512)
     num_inner_epochs = config.train.num_inner_epochs
+    use_role_advantage = spy_cfg.get('use_role_advantage', False)
 
     # ==================== TRAINING LOOP ====================
     logger.info("***** Running Bagel Spy-Civ Flow-GRPO Training *****")
@@ -521,7 +523,18 @@ def main(_):
             all_game_outcomes.append(game_outcome)
 
         # ── Group-relative advantages ────────────────────────────
-        flat_rewards = [r for rw in all_game_rewards for r in rw]
+        if use_role_advantage:
+            # Vision-Zero style: subtract per-role EMA baselines before normalization
+            adjusted_rewards = []
+            for g in range(G):
+                spy_pid = all_game_data_list[g]['spy_player']
+                adj = game_generator.apply_role_advantage(all_game_rewards[g], spy_pid)
+                adjusted_rewards.append(adj)
+            flat_rewards_raw = [r for rw in all_game_rewards for r in rw]
+            flat_rewards = [r for rw in adjusted_rewards for r in rw]
+        else:
+            flat_rewards_raw = [r for rw in all_game_rewards for r in rw]
+            flat_rewards = flat_rewards_raw
         advantages = compute_group_advantages(flat_rewards).to(accelerator.device)
 
         # ── Comprehensive Logging ────────────────────────────────
@@ -534,10 +547,10 @@ def main(_):
             # === Reward metrics ===
             reward_metrics = {
                 "epoch": epoch,
-                "mean_reward": np.mean(flat_rewards),
-                "reward_std": np.std(flat_rewards),
-                "reward_min": np.min(flat_rewards),
-                "reward_max": np.max(flat_rewards),
+                "mean_reward": np.mean(flat_rewards_raw),
+                "reward_std": np.std(flat_rewards_raw),
+                "reward_min": np.min(flat_rewards_raw),
+                "reward_max": np.max(flat_rewards_raw),
                 "spy_mean_reward": np.mean(epoch_spy_rewards) if epoch_spy_rewards else 0,
                 "civ_mean_reward": np.mean(epoch_civ_rewards) if epoch_civ_rewards else 0,
                 "advantage_mean": advantages.mean().item(),
@@ -551,7 +564,12 @@ def main(_):
                 "spy_detection_rate_epoch": sum(1 for o in all_game_outcomes if o['spy_caught']) / G,
                 "ema_baseline_spy": game_generator.b_spy,
                 "ema_baseline_civ": game_generator.b_civ,
+                "ema_baseline_gap": game_generator.b_civ - game_generator.b_spy,
+                "use_role_advantage": float(use_role_advantage),
             }
+            if use_role_advantage:
+                game_metrics["mean_adjusted_reward"] = np.mean(flat_rewards)
+                game_metrics["adjusted_reward_std"] = np.std(flat_rewards)
 
             # === Vote statistics ===
             vote_stats = compute_vote_statistics(all_game_votes, all_game_data_list)

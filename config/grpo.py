@@ -1059,6 +1059,7 @@ def spy_game_bagel():
     config.spy_game.num_objects_min = 3
     config.spy_game.num_objects_max = 6
     config.spy_game.num_to_modify = 2
+    config.spy_game.use_role_advantage = False  # Enable Vision-Zero style role advantage
 
     config.activation_checkpointing = True
     config.fsdp_optimizer_offload = True

@@ -363,6 +363,34 @@ class SpyGameDataGenerator:
         self.b_civ = self.ema_alpha * self.b_civ + (1 - self.ema_alpha) * civ_avg_reward
         self.update_count += 1
 
+    def apply_role_advantage(self, rewards, spy_player):
+        """Apply role-based advantage adjustment (Vision-Zero style).
+
+        Subtracts per-role EMA baselines from rewards before group normalization.
+        This prevents the spy/civilian reward imbalance from dominating the
+        advantage signal. Without it, the model may learn that "being civilian
+        always gives higher reward" instead of learning to generate better.
+
+        Formula:
+            adjusted_reward[spy] = reward[spy] - b_spy
+            adjusted_reward[civ] = reward[civ] - b_civ
+
+        Args:
+            rewards: List of per-player rewards (0-indexed).
+            spy_player: 1-indexed spy player ID.
+
+        Returns:
+            List of adjusted rewards.
+        """
+        adjusted = []
+        for i, r in enumerate(rewards):
+            pid = i + 1
+            if pid == spy_player:
+                adjusted.append(r - self.b_spy)
+            else:
+                adjusted.append(r - self.b_civ)
+        return adjusted
+
 
 # ─── Text-file based game data generators ────────────────────────────────────
 
