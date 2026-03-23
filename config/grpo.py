@@ -1015,5 +1015,78 @@ def pickscore_bagel_lora():
     return config
 
 
+def spy_game_bagel():
+    """Bagel training with spy-civ game reward (Vision-Zero style)."""
+    gpu_number = 8
+    config = compressibility()
+
+    config.run_name = "[bagel-spy-game]-8gpu"
+    config.pretrained.model = "ByteDance-Seed/BAGEL-7B-MoT"
+    config.dataset = os.path.join(os.getcwd(), "dataset/spy_game")
+    config.prompt_fn = "spy_game"
+
+    config.use_lora = False
+    config.resolution = 512
+    config.mixed_precision = "bf16"
+
+    # Sampling - smaller batch due to slow VLM reward
+    config.sample.num_steps = 15
+    config.sample.eval_num_steps = 50
+    config.sample.guidance_scale = 4.0
+    config.sample.eval_guidance_scale = 4.0
+    config.sample.train_batch_size = 4
+    config.sample.num_image_per_prompt = 4
+    config.sample.num_batches_per_epoch = 2
+    config.sample.test_batch_size = 1
+    config.sample.same_latent = False
+    config.sample.global_std = False
+    config.sample.noise_level = 1.3
+    config.sample.sde_window_size = 3
+    config.sample.sde_window_range = (0, config.sample.num_steps // 2)
+
+    # Training
+    config.train.batch_size = config.sample.train_batch_size
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch
+    config.train.num_inner_epochs = 1
+    config.train.clip_range_lt = 1e-5
+    config.train.clip_range_gt = 1e-5
+    config.train.beta = 0
+    config.train.learning_rate = 1e-4
+    config.train.cfg = True
+    config.train.ema = False
+
+    # Reward
+    config.reward_fn = {
+        "spy_game": 1.0,
+    }
+
+    # Spy game config
+    config.spy_game = ml_collections.ConfigDict()
+    config.spy_game.num_players = 4
+    config.spy_game.vlm_endpoint = "http://127.0.0.1:17140/v1"
+    config.spy_game.vlm_model = "Qwen2-VL-7B"
+    config.spy_game.clue_max_tokens = 256
+    config.spy_game.vote_max_tokens = 512
+
+    config.per_prompt_stat_tracking = True
+    config.activation_checkpointing = True
+    config.fsdp_optimizer_offload = True
+
+    config.save_freq = 30
+    config.eval_freq = 30
+    config.save_dir = 'logs/spy_game/bagel'
+
+    return config
+
+
+def spy_game_bagel_lora():
+    """Bagel LoRA training with spy-civ game reward."""
+    config = spy_game_bagel()
+    config.use_lora = True
+    config.run_name = "[bagel-spy-game-lora]-8gpu"
+    config.save_dir = 'logs/spy_game/bagel_lora'
+    return config
+
+
 def get_config(name):
     return globals()[name]()

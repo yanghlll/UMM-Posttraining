@@ -528,8 +528,39 @@ def main(_):
             shuffle=False,
             num_workers=8,
         )
+    elif config.prompt_fn == "spy_game":
+        from flow_grpo.spy_game_data import SpyGamePromptDataset
+        train_dataset = SpyGamePromptDataset(config.dataset, 'train',
+                                             num_players=getattr(getattr(config, 'spy_game', None), 'num_players', 4))
+        test_dataset = SpyGamePromptDataset(config.dataset, 'test',
+                                            num_players=getattr(getattr(config, 'spy_game', None), 'num_players', 4),
+                                            num_procedural=512)
+
+        train_sampler = DistributedKRepeatSampler(
+            dataset=train_dataset,
+            batch_size=config.sample.train_batch_size,
+            k=config.sample.num_image_per_prompt,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            seed=42
+        )
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            num_workers=1,
+            collate_fn=SpyGamePromptDataset.collate_fn,
+        )
+
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=config.sample.test_batch_size,
+            collate_fn=SpyGamePromptDataset.collate_fn,
+            shuffle=False,
+            num_workers=8,
+        )
     else:
-        raise NotImplementedError("Only general_ocr is supported with dataset")
+        raise NotImplementedError("Only general_ocr, geneval, and spy_game are supported with dataset")
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
     # initialize stat tracker
@@ -543,8 +574,8 @@ def main(_):
 
     # accelerator.state.fsdp_plugin.ignored_modules=[model.language_model.model.embed_tokens] 
     # prepare prompt and reward fn
-    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
-    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn, config=config)
+    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn, config=config)
 
     if config.train.beta>0:
         transformer, language_model_ref, optimizer, train_dataloader, test_dataloader = accelerator.prepare(
