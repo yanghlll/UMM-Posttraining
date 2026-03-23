@@ -148,23 +148,27 @@ class SpyGameDataGenerator:
     def format_generation_prompt(self, game_data, player_id):
         """Create image generation prompt for a player.
 
+        Each player knows their player number, total players, and role.
         Spy gets modified description with stealth instruction.
         Civilian gets original description with faithful render instruction.
         """
         desc = game_data["player_descriptions"][player_id - 1]
         spy_player = game_data["spy_player"]
+        N = game_data["num_players"]
 
         if player_id == spy_player:
             role_hint = (
-                "You are the SPY. Your scene description is slightly different "
-                "from the other players'. Generate an image that looks as similar "
-                "as possible to what the original scene might look like, to avoid detection."
+                f"You are PLAYER {player_id} of {N} in a game of \"Who's the Odd One Out?\". "
+                f"Your role: SPY. Your scene description is slightly different "
+                f"from the other players'. Generate an image that looks as similar "
+                f"as possible to what the original scene might look like, to avoid detection."
             )
         else:
             role_hint = (
-                "You are a CIVILIAN. Generate an image that faithfully represents "
-                "the scene description. Your image should be consistent with "
-                "other civilian players' images."
+                f"You are PLAYER {player_id} of {N} in a game of \"Who's the Odd One Out?\". "
+                f"Your role: CIVILIAN. Generate an image that faithfully represents "
+                f"the scene description. Your image should be consistent with "
+                f"other civilian players' images."
             )
 
         return (
@@ -176,9 +180,13 @@ class SpyGameDataGenerator:
         )
 
     def format_generation_prompt_simple(self, game_data, player_id):
-        """Simple generation prompt — just the scene description."""
+        """Simple generation prompt with player identity."""
         desc = game_data["player_descriptions"][player_id - 1]
-        return f"A 3D rendered scene with geometric objects on a flat surface: {desc}"
+        N = game_data["num_players"]
+        return (
+            f"You are Player {player_id} of {N}. "
+            f"A 3D rendered scene with geometric objects on a flat surface: {desc}"
+        )
 
     def format_voting_prompt(self, game_data, player_id=None):
         """Create voting prompt for identifying the spy.
