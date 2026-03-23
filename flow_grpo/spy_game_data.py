@@ -51,17 +51,45 @@ def _generate_scene(rng, num_min=3, num_max=6):
     return objects
 
 
-def _modify_scene(rng, objects, num_modify=2):
+def _modify_scene(rng, objects, num_modify=2, max_props_per_obj=1):
+    """Create a subtly modified version of the scene.
+
+    Args:
+        rng: Random instance.
+        objects: List of object dicts.
+        num_modify: How many objects to modify.
+        max_props_per_obj: Max properties to change per object (1=subtle, 4=full replace).
+            1 = only change color OR shape OR size OR material (very subtle)
+            2 = change up to 2 properties (moderate)
+    """
     modified = [dict(o) for o in objects]
     num_modify = min(num_modify, len(objects))
     indices = rng.sample(range(len(objects)), num_modify)
-    existing = [(o['color'], o['shape'], o['size'], o['material']) for o in objects]
+
+    prop_pools = {
+        'color': [c for c in COLORS],
+        'shape': [s for s in SHAPES],
+        'size': [s for s in SIZES],
+        'material': [m for m in MATERIALS],
+    }
+
     for idx in indices:
-        new = _generate_object(rng, exclude=existing)
-        new['position'] = modified[idx]['position']
-        new['index'] = modified[idx]['index']
-        modified[idx] = new
-        existing[idx] = (new['color'], new['shape'], new['size'], new['material'])
+        old_obj = modified[idx]
+        new_obj = dict(old_obj)
+
+        # Pick which properties to change (1 to max_props_per_obj)
+        changeable = ['color', 'shape', 'size', 'material']
+        n_change = rng.randint(1, min(max_props_per_obj, len(changeable)))
+        props_to_change = rng.sample(changeable, n_change)
+
+        for prop in props_to_change:
+            old_val = old_obj[prop]
+            candidates = [v for v in prop_pools[prop] if v != old_val]
+            if candidates:
+                new_obj[prop] = rng.choice(candidates)
+
+        modified[idx] = new_obj
+
     return modified, indices
 
 
@@ -82,11 +110,18 @@ def _describe_scene(objects, style='list'):
         return ' '.join(lines)
 
 
-def generate_scene_pair(seed):
-    """Generate (original_desc, modified_desc, metadata) pair."""
+def generate_scene_pair(seed, num_to_modify=2, max_props_per_obj=1):
+    """Generate (original_desc, modified_desc, metadata) pair.
+
+    Args:
+        seed: Random seed.
+        num_to_modify: Number of objects to modify.
+        max_props_per_obj: Max properties changed per object (1=subtle, 4=full).
+    """
     rng = random.Random(seed)
     objects = _generate_scene(rng)
-    modified, indices = _modify_scene(rng, objects)
+    modified, indices = _modify_scene(rng, objects, num_modify=num_to_modify,
+                                       max_props_per_obj=max_props_per_obj)
     style = rng.choice(['list', 'narrative', 'structured'])
     orig = _describe_scene(objects, style=style)
     mod = _describe_scene(modified, style=style)
@@ -111,11 +146,12 @@ class SpyGameDataGenerator:
     """
 
     def __init__(self, num_players=4, num_objects_min=3, num_objects_max=6,
-                 num_to_modify=2):
+                 num_to_modify=2, max_props_per_obj=1):
         self.num_players = num_players
         self.num_objects_min = num_objects_min
         self.num_objects_max = num_objects_max
         self.num_to_modify = num_to_modify
+        self.max_props_per_obj = max_props_per_obj  # 1=subtle, 2=moderate, 4=full replace
         # EMA baselines
         self.b_spy = 0.0
         self.b_civ = 0.0
@@ -125,7 +161,9 @@ class SpyGameDataGenerator:
     def generate_game(self, epoch, sample_idx):
         """Generate a complete game instance."""
         seed = epoch * 10000 + sample_idx
-        orig, mod, diff_meta = generate_scene_pair(seed)
+        orig, mod, diff_meta = generate_scene_pair(
+            seed, num_to_modify=self.num_to_modify,
+            max_props_per_obj=self.max_props_per_obj)
         rng = random.Random(seed + 1)
         spy_player = rng.randint(1, self.num_players)
 
