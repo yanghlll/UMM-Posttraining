@@ -1235,29 +1235,26 @@ class Bagel(PreTrainedModel):
         key_values_lens = key_values_lens.to(device)
         packed_key_value_indexes = packed_key_value_indexes.to(device)
 
+        # Restore original working logic (split+cat per step) with minor cleanups
+        extra_inputs = {"mode": "und"} if self.use_moe else {}
+        batch_size = len(key_values_lens)
+
         step = 0
         generated_sequence = []
         curr_tokens = packed_start_tokens
-        if hasattr(self, '_eos_mask'):
-            del self._eos_mask
+        eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device) if batch_size > 1 else None
+
         while step < max_length:
             generated_sequence.append(curr_tokens)
             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
-                0, len(key_values_lens), 
-                device=key_values_lens.device, 
-                dtype=key_values_lens.dtype
-            )
+                0, batch_size, device=device, dtype=key_values_lens.dtype)
 
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):
-                uppacked[i] += i
+                uppacked[i] = uppacked[i] + i
             packed_key_value_indexes = torch.cat(uppacked, dim=0)
-
-            extra_inputs = {}
-            if self.use_moe:
-                extra_inputs = {"mode": "und"}
 
             output = self.language_model.forward(
                 packed_query_sequence=packed_text_embedding,
@@ -1272,8 +1269,7 @@ class Bagel(PreTrainedModel):
                 **extra_inputs,
             )
             past_key_values = output.past_key_values
-            packed_query_sequence = output.packed_query_sequence
-            pred_logits = self.language_model.lm_head(packed_query_sequence)
+            pred_logits = self.language_model.lm_head(output.packed_query_sequence)
 
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
@@ -1284,29 +1280,23 @@ class Bagel(PreTrainedModel):
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):
                 uppacked[i] = torch.cat(
-                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
-                )
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=device)], dim=0)
             packed_key_value_indexes = torch.cat(uppacked, dim=0)
             key_values_lens = key_values_lens + 1
             packed_query_position_ids = packed_query_position_ids + 1
             step += 1
 
-            # Early stop: check ALL samples for EOS (supports batch>1)
+            # Early stop (supports batch>1)
             if end_token_id is not None:
-                if len(curr_tokens) == 1:
+                if batch_size == 1:
                     if curr_tokens[0] == end_token_id:
                         break
                 else:
-                    # Track which samples are done
-                    if not hasattr(self, '_eos_mask'):
-                        self._eos_mask = torch.zeros(len(curr_tokens), dtype=torch.bool, device=curr_tokens.device)
-                    self._eos_mask |= (curr_tokens == end_token_id)
-                    if self._eos_mask.all():
-                        del self._eos_mask
+                    eos_mask |= (curr_tokens == end_token_id)
+                    if eos_mask.all():
                         break
 
-        output_device = generated_sequence[0].device
-        return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
+        return torch.stack(generated_sequence, dim=0)
 
     # for evaluation
     @torch.no_grad()
