@@ -28,7 +28,18 @@ class InterleaveInferencer:
         self.vit_transform = vit_transform
         self.new_token_ids = new_token_ids
         
-    def init_gen_context(self): 
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
+    def _to_device(self, d):
+        """Move all tensors in a dict to model device."""
+        for k, v in d.items():
+            if isinstance(v, torch.Tensor):
+                d[k] = v.to(self.device)
+        return d
+
+    def init_gen_context(self):
         gen_context = {
             'kv_lens': [0],
             'ropes': [0],
@@ -45,12 +56,12 @@ class InterleaveInferencer:
         ropes = gen_context['ropes']
         generation_input, kv_lens, ropes = self.model.prepare_prompts(
             curr_kvlens=kv_lens,
-            curr_rope=ropes, 
+            curr_rope=ropes,
             prompts=[text],
-            tokenizer=self.tokenizer, 
+            tokenizer=self.tokenizer,
             new_token_ids=self.new_token_ids,
         )
-
+        self._to_device(generation_input)
         past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)        
         gen_context['kv_lens'] = kv_lens
         gen_context['ropes'] = ropes
@@ -71,22 +82,24 @@ class InterleaveInferencer:
             ## update vae
             generation_input, kv_lens, ropes = self.model.prepare_vae_images(
                 curr_kvlens=kv_lens,
-                curr_rope=ropes, 
+                curr_rope=ropes,
                 images=[image],
-                transforms=self.vae_transform, 
+                transforms=self.vae_transform,
                 new_token_ids=self.new_token_ids,
             )
+            self._to_device(generation_input)
             past_key_values = self.model.forward_cache_update_vae(self.vae_model, past_key_values, **generation_input)
         
         if vit:
             ## update vit
             generation_input, kv_lens, ropes = self.model.prepare_vit_images(
                 curr_kvlens=kv_lens,
-                curr_rope=ropes, 
+                curr_rope=ropes,
                 images=[image],
-                transforms=self.vit_transform, 
+                transforms=self.vit_transform,
                 new_token_ids=self.new_token_ids,
             )
+            self._to_device(generation_input)
             past_key_values = self.model.forward_cache_update_vit(past_key_values, **generation_input)
 
         gen_context['kv_lens'] = kv_lens
@@ -129,30 +142,32 @@ class InterleaveInferencer:
         ropes = gen_context['ropes']
         generation_input = self.model.prepare_vae_latent(
             curr_kvlens=kv_lens,
-            curr_rope=ropes, 
-            image_sizes=[image_shape], 
+            curr_rope=ropes,
+            image_sizes=[image_shape],
             new_token_ids=self.new_token_ids,
             generators=generators
-        ) 
+        )
+        self._to_device(generation_input)
         # text cfg
         cfg_text_past_key_values = cfg_text_precontext['past_key_values']
         kv_lens_cfg = cfg_text_precontext['kv_lens']
         ropes_cfg = cfg_text_precontext['ropes']
         generation_input_cfg_text = self.model.prepare_vae_latent_cfg(
             curr_kvlens=kv_lens_cfg,
-            curr_rope=ropes_cfg, 
-            image_sizes=[image_shape], 
+            curr_rope=ropes_cfg,
+            image_sizes=[image_shape],
         )
-
+        self._to_device(generation_input_cfg_text)
         # img cfg
         cfg_img_past_key_values = cfg_img_precontext['past_key_values']
         kv_lens_cfg = cfg_img_precontext['kv_lens']
         ropes_cfg = cfg_img_precontext['ropes']
         generation_input_cfg_img = self.model.prepare_vae_latent_cfg(
             curr_kvlens=kv_lens_cfg,
-            curr_rope=ropes_cfg, 
-            image_sizes=[image_shape], 
+            curr_rope=ropes_cfg,
+            image_sizes=[image_shape],
         )
+        self._to_device(generation_input_cfg_img)
         if learn:
             clipfrac, clipfrac_gt_one, clipfrac_lt_one, policy_loss, kl_loss, loss = self.model.generate_image_learn(
                 sample=sample,
@@ -243,6 +258,7 @@ class InterleaveInferencer:
         ropes = gen_context['ropes']
 
         generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
+        self._to_device(generation_input)
         unpacked_latent = self.model.generate_text(
             past_key_values=past_key_values,
             max_length=max_length,
