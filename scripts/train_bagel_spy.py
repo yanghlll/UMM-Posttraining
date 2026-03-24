@@ -420,21 +420,16 @@ def main(_):
     vae_transform = ImageTransform(512, 256, 8)
     vit_transform = ImageTransform(490, 112, 7)
 
-    model = load_checkpoint_and_dispatch(
-        model,
-        checkpoint=os.path.join(model_local_dir, "ema.safetensors"),
-        device_map={"": f"cuda:{accelerator.local_process_index}"},
-        offload_buffers=False,
-        dtype=inference_dtype,
-        force_hooks=True,
-        offload_folder="/tmp/offload"
-    )
-    # Remove accelerate dispatch hooks — they add ~10x overhead to autoregressive
-    # generation (1041 AlignDevicesHook calls per forward). Model is fully on GPU
-    # so hooks are unnecessary.
-    from accelerate.hooks import remove_hook_from_module
-    for module in model.modules():
-        remove_hook_from_module(module)
+    # Load weights directly to GPU without accelerate dispatch hooks.
+    # force_hooks=True adds AlignDevicesHook to 1041 modules, causing ~10x
+    # overhead on autoregressive generation. Since model fits on single GPU,
+    # we load weights directly and skip hooks entirely.
+    from safetensors.torch import load_file
+    state_dict = load_file(os.path.join(model_local_dir, "ema.safetensors"),
+                           device=f"cuda:{accelerator.local_process_index}")
+    model.load_state_dict(state_dict, strict=False)
+    del state_dict
+    model = model.to(device=f"cuda:{accelerator.local_process_index}", dtype=inference_dtype)
     model = model.eval()
     torch.cuda.empty_cache()
 
