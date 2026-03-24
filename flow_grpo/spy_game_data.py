@@ -229,7 +229,7 @@ class SpyGameDataGenerator:
         )
 
     def format_voting_prompt(self, game_data, player_id=None):
-        """Create voting prompt for identifying the spy.
+        """Create voting prompt for identifying the spy (Vision-Zero style).
 
         The voter sees all generated images as a labeled grid.
         """
@@ -242,36 +242,72 @@ class SpyGameDataGenerator:
                 f'{N} players each generated an image from a scene description. '
                 f'One player (the spy) received a slightly different description, '
                 f'so their generated image should look subtly different.\n\n'
-                f'All {N} generated images are shown (labeled Player 1-{N}). '
-                f'Compare carefully and identify which player generated the odd image.\n\n'
+                f'All {N} generated images are shown (labeled Player 1-{N}).\n\n'
+                f'What you should do:\n'
+                f'1. Compare all {N} images carefully.\n'
+                f'2. Look for objects that appear different in one image compared to the others.\n'
+                f'3. Identify which player generated the odd image.\n\n'
                 f'Required output format:\n'
-                f'<think>\nYour step-by-step reasoning.\n</think>\n'
-                f'<answer>\nPLAYER_NUMBER (just the number)\n</answer>'
+                f'<think>\n'
+                f'your step-by-step reasoning analyzing each image and comparing them.\n'
+                f'</think>\n'
+                f'<answer>\n'
+                f'PLAYER_NUMBER\n'
+                f'Example answer: 1; 2; 3; 4. (Just the number, don\'t contain any other text)\n'
+                f'</answer>'
             )
 
         spy_player = game_data["spy_player"]
         if player_id == spy_player:
-            role_info = "Your role: SPY (your description was different)"
-            instruction = (
-                "You know your image might look different. "
-                "Try to vote for someone else to avoid suspicion."
+            role_block = (
+                f'Your role: SPY (your description was different)\n'
+                f'• You are the spy with a slightly different scene description. '
+                f'Your generated image may look different from what others generated.'
+            )
+            action_block = (
+                f'What you should do:\n'
+                f'1. Compare all {N} generated images carefully.\n'
+                f'2. You are the spy: Vote for someone else to avoid suspicion. '
+                f'Choose another player to vote for, but DON\'T vote for yourself '
+                f'as that would reveal your identity.'
             )
         else:
-            role_info = "Your role: CIVILIAN (your description was the same as most)"
-            instruction = (
-                "Look for the image that seems inconsistent with the others. "
-                "Vote for the player you think is the spy."
+            role_block = (
+                f'Your role: NOT SPY (your description was the same as most others)\n'
+                f'• You are not the spy. Your image should be consistent with '
+                f'most other players\' images.'
+            )
+            action_block = (
+                f'What you should do:\n'
+                f'1. Compare all {N} generated images carefully.\n'
+                f'2. You are NOT the spy: Look for the image that seems inconsistent '
+                f'with the others or has different objects/colors/positions. '
+                f'Vote for the player you believe is the spy. '
+                f'There is a reward for voting correctly.'
             )
 
         return (
-            f'You are PLAYER {player_id} in a game of "Who\'s the Odd One Out?". '
+            f'You are PLAYER {player_id} of the game "Who\'s the Odd One Out?". '
             f'Each player generated an image from a scene description. '
-            f'One player (the spy) had a different description.\n\n'
-            f'{role_info}\n\n'
-            f'All {N} generated images are shown. {instruction}\n\n'
+            f'Now this is the decision-making stage. '
+            f'Your task is to vote on who is the Odd Player.\n\n'
+            f'{role_block}\n\n'
+            f'Game Instructions:\n'
+            f'• There are {N} players in total. Only one player (the spy) had a different description.\n'
+            f'• The player voted as the odd player will be severely punished. '
+            f'Therefore all players will try to convince others that they are not the odd player.\n'
+            f'• The spy\'s image may have different objects or attributes compared to the majority.\n\n'
+            f'{action_block}\n\n'
             f'Required output format:\n'
-            f'<think>\nYour step-by-step reasoning.\n</think>\n'
-            f'<answer>\nPLAYER_NUMBER or N/A\n</answer>'
+            f'<think>\n'
+            f'your private step-by-step reasoning — may include suspicions, probabilities, deception, etc.\n'
+            f'</think>\n'
+            f'<answer>\n'
+            f'PLAYER_NUMBER or N/A\n'
+            f'Example answer: 1; 2; 3; N/A. (Just number or N/A, don\'t contain any other text)\n'
+            f'If you are uncertain about who is the spy, you can answer N/A. '
+            f'This will result in a smaller penalty than guessing incorrectly.\n'
+            f'</answer>'
         )
 
     def extract_vote(self, response):
