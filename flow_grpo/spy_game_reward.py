@@ -274,7 +274,9 @@ def batch_generate_images(model, vae_model, tokenizer, new_token_ids,
         latent = latent.reshape(1, h, w, model.latent_patch_size, model.latent_patch_size, model.latent_channel)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, model.latent_channel, h * model.latent_patch_size, w * model.latent_patch_size)
-        image = vae_model.decode(latent)
+        # Cast to VAE dtype (latent may be float32 from SDE step)
+        vae_dtype = next(vae_model.parameters()).dtype
+        image = vae_model.decode(latent.to(vae_dtype))
         image = (image.float() * 0.5 + 0.5).clamp(0, 1)[0]
 
         # Split per-sample latents and log_probs from packed all_latents/all_log_probs
