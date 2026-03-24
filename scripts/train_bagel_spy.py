@@ -439,6 +439,12 @@ def main(_):
         force_hooks=True,
         offload_folder="/tmp/offload"
     )
+    # Remove accelerate dispatch hooks — they add ~10x overhead to autoregressive
+    # generation (1041 AlignDevicesHook calls per forward). Model is fully on GPU
+    # so hooks are unnecessary.
+    from accelerate.hooks import remove_hook_from_module
+    for module in model.modules():
+        remove_hook_from_module(module)
     model = model.eval()
 
     vae_model.requires_grad_(False)
