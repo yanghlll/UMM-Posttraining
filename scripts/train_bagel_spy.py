@@ -54,6 +54,116 @@ from PIL import Image
 from peft import LoraConfig, get_peft_model
 from flow_grpo.fsdp_utils import save_fsdp_checkpoint
 from huggingface_hub import snapshot_download
+from concurrent.futures import ThreadPoolExecutor
+
+
+# ─── Async logging helper ────────────────────────────────────────────────────
+_log_executor = ThreadPoolExecutor(max_workers=1)
+
+def _async_log_metrics(all_game_images_t, all_game_data_list, all_game_rewards,
+                       all_game_votes, all_game_outcomes, flat_rewards_raw,
+                       flat_rewards, advantages, epoch_spy_rewards, epoch_civ_rewards,
+                       spy_caught_count, total_games, game_generator,
+                       use_role_advantage, G, num_players, t_gen_total, t_vote_total,
+                       batch_time, epoch, global_step, config):
+    """Run all logging in background thread to avoid blocking GPU."""
+    spy_rate = spy_caught_count / max(total_games, 1)
+
+    reward_metrics = {
+        "epoch": epoch,
+        "mean_reward": np.mean(flat_rewards_raw),
+        "reward_std": np.std(flat_rewards_raw),
+        "reward_min": np.min(flat_rewards_raw),
+        "reward_max": np.max(flat_rewards_raw),
+        "spy_mean_reward": np.mean(epoch_spy_rewards) if epoch_spy_rewards else 0,
+        "civ_mean_reward": np.mean(epoch_civ_rewards) if epoch_civ_rewards else 0,
+        "advantage_mean": float(advantages.mean()),
+        "advantage_std": float(advantages.std()),
+        "advantage_abs_max": float(advantages.abs().max()),
+    }
+
+    game_metrics = {
+        "spy_detection_rate": spy_rate,
+        "spy_detection_rate_epoch": sum(1 for o in all_game_outcomes if o['spy_caught']) / G,
+        "ema_baseline_spy": game_generator.b_spy,
+        "ema_baseline_civ": game_generator.b_civ,
+        "ema_baseline_gap": game_generator.b_civ - game_generator.b_spy,
+        "use_role_advantage": float(use_role_advantage),
+    }
+    if use_role_advantage:
+        game_metrics["mean_adjusted_reward"] = np.mean(flat_rewards)
+        game_metrics["adjusted_reward_std"] = np.std(flat_rewards)
+
+    vote_stats = compute_vote_statistics(all_game_votes, all_game_data_list)
+
+    # Image diversity metrics (compute on CPU copies to avoid blocking GPU)
+    diversity_metrics = {}
+    spy_div_metrics = {}
+    try:
+        diversity_accum = defaultdict(list)
+        spy_div_accum = defaultdict(list)
+        for g_idx in range(G):
+            imgs = all_game_images_t[g_idx]
+            d = compute_image_diversity_metrics(imgs)
+            for k, v in d.items():
+                diversity_accum[k].append(v)
+            spy_idx = all_game_data_list[g_idx]['spy_player'] - 1
+            s = compute_spy_vs_civ_divergence(imgs, spy_idx)
+            for k, v in s.items():
+                spy_div_accum[k].append(v)
+        diversity_metrics = {k: np.mean(v) for k, v in diversity_accum.items()}
+        spy_div_metrics = {k: np.mean(v) for k, v in spy_div_accum.items()}
+    except Exception:
+        pass
+
+    timing_metrics = {
+        "batch_time": batch_time,
+        "games_per_sec": G / max(batch_time, 0.01),
+        "time_generation": t_gen_total,
+        "time_voting": t_vote_total,
+        "time_other": batch_time - t_gen_total - t_vote_total,
+        "pct_generation": t_gen_total / max(batch_time, 0.01) * 100,
+        "pct_voting": t_vote_total / max(batch_time, 0.01) * 100,
+    }
+
+    all_metrics = {
+        **reward_metrics, **game_metrics, **vote_stats,
+        **diversity_metrics, **spy_div_metrics, **timing_metrics,
+    }
+    wandb.log(all_metrics, step=global_step)
+
+    logger.info(
+        f"Epoch {epoch} | "
+        f"R={np.mean(flat_rewards_raw):.3f}±{np.std(flat_rewards_raw):.3f} "
+        f"SpyR={np.mean(epoch_spy_rewards) if epoch_spy_rewards else 0:.3f} "
+        f"CivR={np.mean(epoch_civ_rewards) if epoch_civ_rewards else 0:.3f} | "
+        f"SpyRate={spy_rate:.1%} VoteAcc={vote_stats.get('vote_accuracy', 0):.1%} | "
+        f"CosSim={diversity_metrics.get('img_cosine_sim', 0):.3f} "
+        f"SpyCivRatio={spy_div_metrics.get('spy_civ_mse_ratio', 0):.2f} | "
+        f"{batch_time:.1f}s"
+    )
+
+    if epoch % 5 == 0 and all_game_images_t:
+        try:
+            pil_for_log = tensor_images_to_pil(torch.stack(all_game_images_t[0]))
+            with tempfile.TemporaryDirectory() as tmpdir:
+                imgs_to_log = []
+                gd = all_game_data_list[0]
+                for pid, img in enumerate(pil_for_log):
+                    path = os.path.join(tmpdir, f"p{pid+1}.jpg")
+                    img.save(path)
+                    is_spy = "SPY" if pid + 1 == gd['spy_player'] else "CIV"
+                    reward = all_game_rewards[0][pid]
+                    vote = all_game_votes[0][pid]
+                    vote_str = str(vote.get('voted_spy', '?')) if vote else 'INVALID'
+                    imgs_to_log.append(wandb.Image(
+                        path, caption=f"P{pid+1}({is_spy}) R={reward:.2f} Vote={vote_str}"))
+                grid_path = os.path.join(tmpdir, "grid.jpg")
+                build_voting_grid(pil_for_log, cell_size=config.resolution).save(grid_path)
+                imgs_to_log.append(wandb.Image(grid_path, caption="Voting Grid"))
+                wandb.log({"game_images": imgs_to_log}, step=global_step)
+        except Exception:
+            pass
 
 
 # ─── Image diversity metrics (GPU-native, single sync) ──────────────────────
@@ -650,109 +760,25 @@ def main(_):
             flat_rewards = flat_rewards_raw
         advantages = compute_group_advantages(flat_rewards).to(accelerator.device)
 
-        # ── Comprehensive Logging ────────────────────────────────
+        # ── Async Logging (non-blocking, runs in background thread) ──
         if accelerator.is_main_process:
             batch_time = time.time() - batch_time_start
             batch_time_start = time.time()
 
-            spy_rate = spy_caught_count / max(total_games, 1)
+            # Copy data to CPU for async logging (don't hold GPU tensors)
+            _images_cpu = [[t.cpu() for t in g_imgs] for g_imgs in all_game_images_t]
+            _adv_cpu = advantages.cpu()
 
-            # === Reward metrics ===
-            reward_metrics = {
-                "epoch": epoch,
-                "mean_reward": np.mean(flat_rewards_raw),
-                "reward_std": np.std(flat_rewards_raw),
-                "reward_min": np.min(flat_rewards_raw),
-                "reward_max": np.max(flat_rewards_raw),
-                "spy_mean_reward": np.mean(epoch_spy_rewards) if epoch_spy_rewards else 0,
-                "civ_mean_reward": np.mean(epoch_civ_rewards) if epoch_civ_rewards else 0,
-                "advantage_mean": advantages.mean().item(),
-                "advantage_std": advantages.std().item(),
-                "advantage_abs_max": advantages.abs().max().item(),
-            }
-
-            # === Game metrics ===
-            game_metrics = {
-                "spy_detection_rate": spy_rate,
-                "spy_detection_rate_epoch": sum(1 for o in all_game_outcomes if o['spy_caught']) / G,
-                "ema_baseline_spy": game_generator.b_spy,
-                "ema_baseline_civ": game_generator.b_civ,
-                "ema_baseline_gap": game_generator.b_civ - game_generator.b_spy,
-                "use_role_advantage": float(use_role_advantage),
-            }
-            if use_role_advantage:
-                game_metrics["mean_adjusted_reward"] = np.mean(flat_rewards)
-                game_metrics["adjusted_reward_std"] = np.std(flat_rewards)
-
-            # === Vote statistics ===
-            vote_stats = compute_vote_statistics(all_game_votes, all_game_data_list)
-
-            # === Image diversity metrics (averaged over all G games) ===
-            diversity_metrics_accum = defaultdict(list)
-            spy_div_metrics_accum = defaultdict(list)
-            for g_idx in range(G):
-                div_m = compute_image_diversity_metrics(all_game_images_t[g_idx])
-                for k, v in div_m.items():
-                    diversity_metrics_accum[k].append(v)
-
-                spy_idx = all_game_data_list[g_idx]['spy_player'] - 1
-                spy_div_m = compute_spy_vs_civ_divergence(
-                    all_game_images_t[g_idx], spy_idx)
-                for k, v in spy_div_m.items():
-                    spy_div_metrics_accum[k].append(v)
-
-            diversity_metrics = {k: np.mean(v) for k, v in diversity_metrics_accum.items()}
-            spy_div_metrics = {k: np.mean(v) for k, v in spy_div_metrics_accum.items()}
-
-            # === Timing (per-phase breakdown) ===
-            timing_metrics = {
-                "batch_time": batch_time,
-                "games_per_sec": G / max(batch_time, 0.01),
-                "time_generation": t_gen_total,
-                "time_voting": t_vote_total,
-                "time_other": batch_time - t_gen_total - t_vote_total,
-                "pct_generation": t_gen_total / max(batch_time, 0.01) * 100,
-                "pct_voting": t_vote_total / max(batch_time, 0.01) * 100,
-            }
-
-            # Merge all and log
-            all_metrics = {
-                **reward_metrics, **game_metrics, **vote_stats,
-                **diversity_metrics, **spy_div_metrics, **timing_metrics,
-            }
-            wandb.log(all_metrics, step=global_step)
-
-            # Log to console
-            logger.info(
-                f"Epoch {epoch} | "
-                f"R={np.mean(flat_rewards):.3f}±{np.std(flat_rewards):.3f} "
-                f"SpyR={np.mean(epoch_spy_rewards):.3f} CivR={np.mean(epoch_civ_rewards):.3f} | "
-                f"SpyRate={spy_rate:.1%} VoteAcc={vote_stats.get('vote_accuracy', 0):.1%} | "
-                f"CosSim={diversity_metrics.get('img_cosine_sim', 0):.3f} "
-                f"SpyCivRatio={spy_div_metrics.get('spy_civ_mse_ratio', 0):.2f} | "
-                f"{batch_time:.1f}s"
+            _log_executor.submit(
+                _async_log_metrics,
+                _images_cpu, list(all_game_data_list), list(all_game_rewards),
+                list(all_game_votes), list(all_game_outcomes),
+                list(flat_rewards_raw), list(flat_rewards), _adv_cpu,
+                list(epoch_spy_rewards), list(epoch_civ_rewards),
+                spy_caught_count, total_games, game_generator,
+                use_role_advantage, G, num_players, t_gen_total, t_vote_total,
+                batch_time, epoch, global_step, config,
             )
-
-            # Log sample images every 5 epochs (only convert to PIL here)
-            if epoch % 5 == 0 and all_game_images_t:
-                pil_for_log = tensor_images_to_pil(torch.stack(all_game_images_t[0]))
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    imgs_to_log = []
-                    gd = all_game_data_list[0]
-                    for pid, img in enumerate(pil_for_log):
-                        path = os.path.join(tmpdir, f"p{pid+1}.jpg")
-                        img.save(path)
-                        is_spy = "SPY" if pid + 1 == gd['spy_player'] else "CIV"
-                        reward = all_game_rewards[0][pid]
-                        vote = all_game_votes[0][pid]
-                        vote_str = str(vote.get('voted_spy', '?')) if vote else 'INVALID'
-                        imgs_to_log.append(wandb.Image(
-                            path,
-                            caption=f"P{pid+1}({is_spy}) R={reward:.2f} Vote={vote_str}"))
-                    grid_path = os.path.join(tmpdir, "grid.jpg")
-                    build_voting_grid(pil_for_log, cell_size=config.resolution).save(grid_path)
-                    imgs_to_log.append(wandb.Image(grid_path, caption="Voting Grid"))
-                    wandb.log({"game_images": imgs_to_log}, step=global_step)
 
         # ── Training: per-player per-SDE-step backward ───────────
         transformer.train()
@@ -845,12 +871,12 @@ def main(_):
                     adv_idx += 1
 
                     if accelerator.sync_gradients:
-                        log_info = {k: torch.mean(torch.stack(v)) for k, v in info.items()} if info["loss"] else {}
-                        if log_info:
-                            log_info = accelerator.reduce(log_info, reduction="mean")
-                            log_info["abs_policy_loss"] = abs(log_info["policy_loss"].item())
-                        log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                        if accelerator.is_main_process:
+                        # Log training metrics locally (no cross-rank reduce to avoid sync)
+                        if info["loss"] and accelerator.is_main_process:
+                            log_info = {k: torch.mean(torch.stack(v)).item()
+                                        for k, v in info.items()}
+                            log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
+                            log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
                             wandb.log(log_info, step=global_step)
                         global_step += 1
                         info = defaultdict(list)
