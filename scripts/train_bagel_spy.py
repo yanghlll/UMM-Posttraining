@@ -40,7 +40,7 @@ from flow_grpo.spy_game_data import SpyGameDataGenerator, TextFileGameDataGenera
 from flow_grpo.spy_game_reward import (
     build_voting_grid, build_voting_grid_tensor, grid_tensor_to_pil,
     tensor_images_to_pil, run_bagel_vote, run_bagel_votes_cached,
-    compute_group_advantages,
+    compute_group_advantages, batch_generate_images,
 )
 
 import numpy as np
@@ -471,35 +471,39 @@ def main(_):
         for g in range(G):
             all_game_data_list.append(game_generator.generate_game(epoch * G + g, global_step))
 
-        with autocast():
-            for g in range(G):
-                game_data = all_game_data_list[g]
-                prompts = [
-                    game_generator.format_generation_prompt_simple(game_data, pid)
-                    for pid in range(1, num_players + 1)
-                ]
-                my_trajs_g = {}
-                my_images_g = {}
-                for pid in my_player_ids:
-                    with torch.no_grad():
-                        output_dict = inferencer(
-                            text=prompts[pid],
-                            noise_level=config.sample.noise_level,
-                            grpo_config=config,
-                            accelerator=accelerator,
-                            num_timesteps=config.sample.num_steps,
-                            cfg_text_scale=config.sample.guidance_scale,
-                            **inference_hyper,
-                        )
-                    my_trajs_g[pid] = {
-                        'image': output_dict['image'],
-                        'all_latents': output_dict['all_latents'],
-                        'all_log_probs': output_dict['all_log_probs'],
-                        'timesteps': output_dict['timesteps'],
-                    }
-                    my_images_g[pid] = output_dict['image']
-                all_my_trajs.append(my_trajs_g)
-                all_my_images.append(my_images_g)
+        for g in range(G):
+            game_data = all_game_data_list[g]
+            prompts = [
+                game_generator.format_generation_prompt_simple(game_data, pid)
+                for pid in range(1, num_players + 1)
+            ]
+            # Batch generate: all my_player_ids in one packed forward pass
+            my_prompts = [prompts[pid] for pid in my_player_ids]
+            batch_results = batch_generate_images(
+                model=accelerator.unwrap_model(transformer).to(accelerator.device) if hasattr(transformer, 'module') else model,
+                vae_model=vae_model,
+                tokenizer=tokenizer,
+                new_token_ids=new_token_ids,
+                prompts=my_prompts,
+                grpo_config=config,
+                resolution=config.resolution,
+                cfg_text_scale=config.sample.guidance_scale,
+                cfg_img_scale=inference_hyper.get('cfg_img_scale', 1.0),
+                cfg_interval=inference_hyper.get('cfg_interval', [0, 1.0]),
+                cfg_renorm_min=inference_hyper.get('cfg_renorm_min', 0.0),
+                cfg_renorm_type=inference_hyper.get('cfg_renorm_type', 'global'),
+                timestep_shift=inference_hyper.get('timestep_shift', 3.0),
+                num_timesteps=config.sample.num_steps,
+                noise_level=config.sample.noise_level,
+                process_index=rank,
+            )
+            my_trajs_g = {}
+            my_images_g = {}
+            for i, pid in enumerate(my_player_ids):
+                my_trajs_g[pid] = batch_results[i]
+                my_images_g[pid] = batch_results[i]['image']
+            all_my_trajs.append(my_trajs_g)
+            all_my_images.append(my_images_g)
 
         # SINGLE all_reduce for ALL G games' images at once: [G, N, 3, H, W]
         first_img = list(all_my_images[0].values())[0]

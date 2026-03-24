@@ -161,6 +161,145 @@ def run_bagel_votes_cached(inferencer, grid_image: Image.Image,
     return results
 
 
+# ─── Batch image generation (packed sequence, like gen_images_mp.py) ──────────
+
+def batch_generate_images(model, vae_model, tokenizer, new_token_ids,
+                          prompts, grpo_config, resolution=512,
+                          cfg_text_scale=4.0, cfg_img_scale=1.0,
+                          cfg_interval=(0, 1.0), cfg_renorm_min=0.0,
+                          cfg_renorm_type="global", timestep_shift=3.0,
+                          num_timesteps=15, noise_level=1.3,
+                          vae_transform=None, process_index=0):
+    """Generate N images in one packed batch forward pass.
+
+    Follows the official Bagel eval pattern (gen_images_mp.py).
+    Returns per-sample images, latents, log_probs, and timesteps.
+
+    Args:
+        model: Bagel model (unwrapped).
+        prompts: List of N prompt strings.
+        ... (other args same as inferencer)
+
+    Returns:
+        List of N dicts, each with 'image', 'all_latents', 'all_log_probs', 'timesteps'.
+    """
+    from flow_grpo.bagel.modeling.bagel.qwen2_navit import NaiveCache
+
+    N = len(prompts)
+    device = next(model.parameters()).device
+
+    # ── Step 1: Encode all N prompts into packed KV cache ──
+    past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+    kv_lens = [0] * N
+    ropes = [0] * N
+
+    generation_input, kv_lens, ropes = model.prepare_prompts(
+        curr_kvlens=kv_lens, curr_rope=ropes,
+        prompts=prompts, tokenizer=tokenizer,
+        new_token_ids=new_token_ids,
+    )
+    # Move to device
+    for k, v in generation_input.items():
+        if isinstance(v, torch.Tensor):
+            generation_input[k] = v.to(device)
+
+    with torch.no_grad():
+        with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+            past_key_values = model.forward_cache_update_text(
+                past_key_values, **generation_input)
+
+    # ── Step 2: Prepare N VAE latents ──
+    generation_input = model.prepare_vae_latent(
+        curr_kvlens=kv_lens, curr_rope=ropes,
+        image_sizes=[(resolution, resolution)] * N,
+        new_token_ids=new_token_ids,
+    )
+    for k, v in generation_input.items():
+        if isinstance(v, torch.Tensor):
+            generation_input[k] = v.to(device)
+
+    # ── Step 3: Prepare text-CFG (unconditional) KV cache ──
+    cfg_text_past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+    cfg_kv_lens = [0] * N
+    cfg_ropes = [0] * N
+    generation_input_cfg_text = model.prepare_vae_latent_cfg(
+        curr_kvlens=cfg_kv_lens, curr_rope=cfg_ropes,
+        image_sizes=[(resolution, resolution)] * N,
+    )
+    for k, v in generation_input_cfg_text.items():
+        if isinstance(v, torch.Tensor):
+            generation_input_cfg_text[k] = v.to(device)
+
+    # ── Step 4: Prepare img-CFG KV cache ──
+    cfg_img_past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+    cfg_img_kv_lens = [0] * N
+    cfg_img_ropes = [0] * N
+    generation_input_cfg_img = model.prepare_vae_latent_cfg(
+        curr_kvlens=cfg_img_kv_lens, curr_rope=cfg_img_ropes,
+        image_sizes=[(resolution, resolution)] * N,
+    )
+    for k, v in generation_input_cfg_img.items():
+        if isinstance(v, torch.Tensor):
+            generation_input_cfg_img[k] = v.to(device)
+
+    # ── Step 5: Generate images (packed batch, all N at once) ──
+    with torch.no_grad():
+        with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+            unpacked_latents, all_latents, all_log_probs, timesteps = model.generate_image(
+                past_key_values=past_key_values,
+                cfg_text_past_key_values=cfg_text_past_key_values,
+                cfg_img_past_key_values=cfg_img_past_key_values,
+                num_timesteps=num_timesteps,
+                cfg_text_scale=cfg_text_scale,
+                cfg_img_scale=cfg_img_scale,
+                cfg_interval=list(cfg_interval),
+                cfg_renorm_min=cfg_renorm_min,
+                cfg_renorm_type=cfg_renorm_type,
+                timestep_shift=timestep_shift,
+                noise_level=noise_level,
+                sample_sde_window_size=grpo_config.sample.sde_window_size,
+                sample_sde_window_range=grpo_config.sample.sde_window_range,
+                process_index=process_index,
+                device=device,
+                **generation_input,
+                cfg_text_packed_position_ids=generation_input_cfg_text['cfg_packed_position_ids'],
+                cfg_text_packed_query_indexes=generation_input_cfg_text['cfg_packed_query_indexes'],
+                cfg_text_key_values_lens=generation_input_cfg_text['cfg_key_values_lens'],
+                cfg_text_packed_key_value_indexes=generation_input_cfg_text['cfg_packed_key_value_indexes'],
+                cfg_img_packed_position_ids=generation_input_cfg_img['cfg_packed_position_ids'],
+                cfg_img_packed_query_indexes=generation_input_cfg_img['cfg_packed_query_indexes'],
+                cfg_img_key_values_lens=generation_input_cfg_img['cfg_key_values_lens'],
+                cfg_img_packed_key_value_indexes=generation_input_cfg_img['cfg_packed_key_value_indexes'],
+            )
+
+    # ── Step 6: Decode and split per-sample results ──
+    results = []
+    for i in range(N):
+        # Decode image from latent
+        latent = unpacked_latents[i]
+        h, w = resolution // model.latent_downsample, resolution // model.latent_downsample
+        latent = latent.reshape(1, h, w, model.latent_patch_size, model.latent_patch_size, model.latent_channel)
+        latent = torch.einsum("nhwpqc->nchpwq", latent)
+        latent = latent.reshape(1, model.latent_channel, h * model.latent_patch_size, w * model.latent_patch_size)
+        image = vae_model.decode(latent.float())
+        image = (image * 0.5 + 0.5).clamp(0, 1)[0].float()
+
+        # Split per-sample latents and log_probs from packed all_latents/all_log_probs
+        # all_log_probs[t] is [N] tensor (per-sample means from generate_image)
+        per_sample_latents = [lat.split([(unpacked_latents[j].shape[0]) for j in range(N)])[i]
+                              for lat in all_latents]
+        per_sample_log_probs = [lp[i] for lp in all_log_probs]
+
+        results.append({
+            'image': image,
+            'all_latents': per_sample_latents,
+            'all_log_probs': per_sample_log_probs,
+            'timesteps': timesteps,
+        })
+
+    return results
+
+
 # ─── Advantages ──────────────────────────────────────────────────────────────
 
 def compute_group_advantages(flat_rewards: List[float], eps: float = 1e-4) -> torch.Tensor:

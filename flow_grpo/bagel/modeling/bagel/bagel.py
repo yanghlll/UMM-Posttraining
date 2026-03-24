@@ -766,11 +766,20 @@ class Bagel(PreTrainedModel):
             )
             if i >= sde_timestep_begin and i < sde_timestep_begin + sample_sde_window_size:
                 all_latents.append(x_t)
-                all_log_probs.append(log_prob)
+                # log_prob is full tensor [total_packed_tokens, latent_dim]
+                # Convert to per-sample mean for GRPO
+                sample_sizes = (packed_seqlens - 2).tolist()
+                num_samples = len(sample_sizes)
+                if num_samples > 1:
+                    lp_splits = log_prob.split(sample_sizes)
+                    per_sample_lp = torch.stack([s.mean() for s in lp_splits])
+                    all_log_probs.append(per_sample_lp)
+                else:
+                    all_log_probs.append(log_prob.mean().unsqueeze(0))
                 all_timesteps.append(t)
-        all_timesteps = torch.tensor(all_timesteps, device=log_prob.device)
+        all_timesteps = torch.tensor(all_timesteps, device=all_log_probs[0].device if all_log_probs else x_t.device)
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent, all_latents, all_log_probs, all_timesteps.to(log_prob.device)
+        return unpacked_latent, all_latents, all_log_probs, all_timesteps
     
     def generate_image_learn(
         self,
@@ -874,15 +883,17 @@ class Bagel(PreTrainedModel):
                 )
             t_index = (original_timesteps == timesteps[i]).nonzero(as_tuple=True)[0]
             _, log_prob, prev_sample_mean, std_dev_t = self._sde_step_with_logprob(
-                v_t, 
-                timesteps[i], 
+                v_t,
+                timesteps[i],
                 timesteps[i+1] if i+1 < len(timesteps) else timesteps[i]*0, # 最后一个step, timestep是0
-                dtimesteps[t_index], 
-                latents[i], 
-                prev_sample=prev_latents[i], 
-                sigma_max=original_timesteps[1], 
+                dtimesteps[t_index],
+                latents[i],
+                prev_sample=prev_latents[i],
+                sigma_max=original_timesteps[1],
                 noise_level=noise_level
             )
+            # Training is always batch=1, so mean the full log_prob tensor to scalar
+            log_prob = log_prob.mean()
             if grpo_config.train.beta > 0:
                 with torch.no_grad():
                     v_t = self._forward_flow(
@@ -1040,9 +1051,8 @@ class Bagel(PreTrainedModel):
 
             log_prob = -((prev_sample.detach() - prev_sample_mean)**2)
 
-        # mean along all but batch dimension
-        log_prob = log_prob.mean()
-
+        # Keep full tensor for per-sample split in generate_image()
+        # Shape: [total_packed_tokens, latent_dim] (packed across all samples)
         return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
 
