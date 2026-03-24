@@ -1228,6 +1228,13 @@ class Bagel(PreTrainedModel):
         temperature: float = 1.0,
         end_token_id: int = None,
     ):
+        # Ensure all inputs on same device (needed after removing accelerate hooks)
+        device = next(self.language_model.parameters()).device
+        packed_start_tokens = packed_start_tokens.to(device)
+        packed_query_position_ids = packed_query_position_ids.to(device)
+        key_values_lens = key_values_lens.to(device)
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+
         step = 0
         generated_sequence = []
         curr_tokens = packed_start_tokens
