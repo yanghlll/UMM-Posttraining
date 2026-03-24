@@ -1231,6 +1231,8 @@ class Bagel(PreTrainedModel):
         step = 0
         generated_sequence = []
         curr_tokens = packed_start_tokens
+        if hasattr(self, '_eos_mask'):
+            del self._eos_mask
         while step < max_length:
             generated_sequence.append(curr_tokens)
             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
@@ -1282,8 +1284,19 @@ class Bagel(PreTrainedModel):
             packed_query_position_ids = packed_query_position_ids + 1
             step += 1
 
-            if end_token_id is not None and curr_tokens[0] == end_token_id: # only support batch=1
-                break
+            # Early stop: check ALL samples for EOS (supports batch>1)
+            if end_token_id is not None:
+                if len(curr_tokens) == 1:
+                    if curr_tokens[0] == end_token_id:
+                        break
+                else:
+                    # Track which samples are done
+                    if not hasattr(self, '_eos_mask'):
+                        self._eos_mask = torch.zeros(len(curr_tokens), dtype=torch.bool, device=curr_tokens.device)
+                    self._eos_mask |= (curr_tokens == end_token_id)
+                    if self._eos_mask.all():
+                        del self._eos_mask
+                        break
 
         output_device = generated_sequence[0].device
         return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)

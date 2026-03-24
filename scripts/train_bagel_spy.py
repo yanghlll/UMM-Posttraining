@@ -40,7 +40,7 @@ from flow_grpo.spy_game_data import SpyGameDataGenerator, TextFileGameDataGenera
 from flow_grpo.spy_game_reward import (
     build_voting_grid, build_voting_grid_tensor, grid_tensor_to_pil,
     tensor_images_to_pil, run_bagel_vote, run_bagel_votes_cached,
-    compute_group_advantages, batch_generate_images,
+    run_bagel_votes_batch, compute_group_advantages, batch_generate_images,
 )
 
 import numpy as np
@@ -527,44 +527,57 @@ def main(_):
         t_gen_total = time.time() - t_gen_start
 
         # ================================================================
-        # BATCHED PHASE 2: Vote ALL games × my votes (no sync)
-        # Each GPU votes for its assigned players across ALL G games.
-        # Only 1 all_reduce at the end.
+        # BATCHED PHASE 2: Vote ALL games × my votes in ONE batch call
+        # Collect all G grid images + prompts, batch generate all votes
+        # at once with batch=G autoregressive decoding.
         # ================================================================
         t_vote_start = time.time()
         all_vote_tensors = torch.full((G, num_players), -2,
                                        device=accelerator.device, dtype=torch.long)
 
-        with torch.no_grad():
-            for g in range(G):
-                game_data = all_game_data_list[g]
-                player_images_g = [all_images_packed[g, pid] for pid in range(num_players)]
-                grid_tensor = build_voting_grid_tensor(player_images_g,
-                                                        cell_size=config.resolution)
-                grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
-                                               cell_size=config.resolution)
+        # Collect all grid images and vote prompts for batch generation
+        all_grid_pils = []
+        all_vote_prompts_flat = []
+        vote_index_map = []  # (g, pid) for each entry
 
-                # Use cached voting: encode grid ViT once, run all my votes
-                my_vote_prompts = [
-                    game_generator.format_voting_prompt(game_data, player_id=pid + 1)
-                    for pid in my_player_ids
-                ]
-                if my_vote_prompts:
-                    vote_texts = run_bagel_votes_cached(
-                        inferencer, grid_pil, my_vote_prompts,
-                        max_tokens=max_vote_tokens,
-                    )
-                else:
-                    vote_texts = []
+        for g in range(G):
+            game_data = all_game_data_list[g]
+            player_images_g = [all_images_packed[g, pid] for pid in range(num_players)]
+            grid_tensor = build_voting_grid_tensor(player_images_g,
+                                                    cell_size=config.resolution)
+            grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
+                                           cell_size=config.resolution)
+            for pid in my_player_ids:
+                all_grid_pils.append(grid_pil)
+                all_vote_prompts_flat.append(
+                    game_generator.format_voting_prompt(game_data, player_id=pid + 1))
+                vote_index_map.append((g, pid))
 
-                for i, pid in enumerate(my_player_ids):
-                    vote_info = game_generator.extract_vote(vote_texts[i])
-                    if vote_info is None:
-                        all_vote_tensors[g, pid] = -1
-                    elif vote_info.get('voted_spy') == 'N/A':
-                        all_vote_tensors[g, pid] = 0
-                    else:
-                        all_vote_tensors[g, pid] = vote_info.get('voted_spy', -1)
+        # Single batch vote call: batch=G*players_per_rank
+        if all_vote_prompts_flat:
+            unwrapped_model = accelerator.unwrap_model(transformer)
+            vote_texts = run_bagel_votes_batch(
+                model=model,
+                tokenizer=tokenizer,
+                new_token_ids=new_token_ids,
+                vit_transform=vit_transform,
+                grid_images=all_grid_pils,
+                vote_prompts=all_vote_prompts_flat,
+                max_tokens=max_vote_tokens,
+                temperature=0.7,
+            )
+        else:
+            vote_texts = []
+
+        # Unpack vote results
+        for idx, (g, pid) in enumerate(vote_index_map):
+            vote_info = game_generator.extract_vote(vote_texts[idx])
+            if vote_info is None:
+                all_vote_tensors[g, pid] = -1
+            elif vote_info.get('voted_spy') == 'N/A':
+                all_vote_tensors[g, pid] = 0
+            else:
+                all_vote_tensors[g, pid] = vote_info.get('voted_spy', -1)
 
         # SINGLE all_reduce for ALL G games' votes
         torch.distributed.all_reduce(all_vote_tensors, op=torch.distributed.ReduceOp.MAX)

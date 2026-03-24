@@ -122,41 +122,115 @@ def run_bagel_votes_cached(inferencer, grid_image: Image.Image,
                            max_tokens: int = 512,
                            temperature: float = 0.7) -> List[str]:
     """Run multiple votes on the same grid image, caching ViT encoding.
-
-    Encodes the grid image once with ViT, then reuses the image KV cache
-    for each vote prompt. ~N× faster than calling run_bagel_vote N times.
-
-    Args:
-        inferencer: Bagel InterleaveInferencer.
-        grid_image: Grid PIL image (same for all voters).
-        vote_prompts: List of vote prompts (one per voter).
-        max_tokens: Max tokens for each vote response.
-        temperature: Sampling temperature.
-
-    Returns:
-        List of vote text strings.
+    Legacy serial version - kept for fallback.
     """
     from copy import deepcopy
     from flow_grpo.bagel.data.data_utils import pil_img2rgb
 
     results = []
-
     with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
-        # Step 1: Encode the grid image ONCE into a base context
         base_context = inferencer.init_gen_context()
         transformed_img = inferencer.vae_transform.resize_transform(pil_img2rgb(grid_image))
         base_context = inferencer.update_context_image(
-            transformed_img, base_context, vae=False)  # understanding mode: vit only
-
-        # Step 2: For each voter, clone base context + encode text + generate
+            transformed_img, base_context, vae=False)
         for prompt in vote_prompts:
-            # Clone the image-encoded context (avoids re-encoding image)
             vote_context = deepcopy(base_context)
             vote_context = inferencer.update_context_text(prompt, vote_context)
             gen_text = inferencer.gen_text(
                 vote_context, do_sample=True,
                 temperature=temperature, max_length=max_tokens)
             results.append(gen_text)
+    return results
+
+
+def run_bagel_votes_batch(model, tokenizer, new_token_ids, vit_transform,
+                          grid_images: List[Image.Image],
+                          vote_prompts: List[str],
+                          max_tokens: int = 512,
+                          temperature: float = 0.7) -> List[str]:
+    """Batch vote: encode N grid images + prompts into packed sequence,
+    generate all N vote texts in one autoregressive pass.
+
+    This gives batch=N for the text generation, increasing GPU utilization
+    from ~160W (batch=1) to much higher.
+
+    Args:
+        model: Unwrapped Bagel model.
+        tokenizer: Qwen2Tokenizer.
+        new_token_ids: Special token IDs dict.
+        vit_transform: ImageTransform for ViT.
+        grid_images: List of N PIL images (can be same or different).
+        vote_prompts: List of N text prompts.
+        max_tokens: Max tokens per vote.
+        temperature: Sampling temperature.
+
+    Returns:
+        List of N vote text strings.
+    """
+    from flow_grpo.bagel.data.data_utils import pil_img2rgb
+    from flow_grpo.bagel.modeling.bagel.qwen2_navit import NaiveCache
+
+    N = len(vote_prompts)
+    device = next(model.parameters()).device
+
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+        # Step 1: Build packed KV cache with N images + N prompts
+        past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+        kv_lens = [0] * N
+        ropes = [0] * N
+
+        # Encode N images with ViT (packed)
+        images_transformed = [vit_transform.resize_transform(pil_img2rgb(img))
+                              for img in grid_images]
+        generation_input, kv_lens, ropes = model.prepare_vit_images(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            images=images_transformed,
+            transforms=vit_transform,
+            new_token_ids=new_token_ids,
+        )
+        for k, v in generation_input.items():
+            if isinstance(v, torch.Tensor):
+                generation_input[k] = v.to(device)
+        past_key_values = model.forward_cache_update_vit(past_key_values, **generation_input)
+
+        # Encode N text prompts (packed)
+        generation_input, kv_lens, ropes = model.prepare_prompts(
+            curr_kvlens=kv_lens,
+            curr_rope=ropes,
+            prompts=vote_prompts,
+            tokenizer=tokenizer,
+            new_token_ids=new_token_ids,
+        )
+        for k, v in generation_input.items():
+            if isinstance(v, torch.Tensor):
+                generation_input[k] = v.to(device)
+        past_key_values = model.forward_cache_update_text(past_key_values, **generation_input)
+
+        # Step 2: Prepare start tokens for batch text generation
+        gen_input = model.prepare_start_tokens(kv_lens, ropes, new_token_ids)
+        for k, v in gen_input.items():
+            if isinstance(v, torch.Tensor):
+                gen_input[k] = v.to(device)
+
+        # Step 3: Batch autoregressive generation (batch=N)
+        output_tokens = model.generate_text(
+            past_key_values=past_key_values,
+            max_length=max_tokens,
+            do_sample=True,
+            temperature=temperature,
+            end_token_id=new_token_ids['eos_token_id'],
+            **gen_input,
+        )
+
+    # Step 4: Decode each sample's tokens
+    results = []
+    for i in range(N):
+        text = tokenizer.decode(output_tokens[:, i])
+        text = text.split('<|im_end|>')[0]
+        if '<|im_start|>' in text:
+            text = text.split('<|im_start|>')[1]
+        results.append(text)
 
     return results
 
