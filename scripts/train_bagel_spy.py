@@ -39,7 +39,8 @@ from flow_grpo.bagel.inferencer import InterleaveInferencer
 from flow_grpo.spy_game_data import SpyGameDataGenerator, TextFileGameDataGenerator
 from flow_grpo.spy_game_reward import (
     build_voting_grid, build_voting_grid_tensor, grid_tensor_to_pil,
-    tensor_images_to_pil, run_bagel_vote, compute_group_advantages,
+    tensor_images_to_pil, run_bagel_vote, run_bagel_votes_cached,
+    compute_group_advantages,
 )
 
 import numpy as np
@@ -490,16 +491,20 @@ def main(_):
             # breaks generate_text() which accesses .model.embed_tokens directly)
             wrapped_lm = model.language_model
             model.language_model = accelerator.unwrap_model(transformer)
-            game_votes = []
+
+            # Build all vote prompts, then run with cached ViT encoding
+            # (encodes grid image once, reuses for all N voters)
+            vote_prompts = [
+                game_generator.format_voting_prompt(game_data, player_id=pid)
+                for pid in range(1, num_players + 1)
+            ]
             with torch.no_grad():
-                for pid in range(1, num_players + 1):
-                    vote_prompt = game_generator.format_voting_prompt(game_data, player_id=pid)
-                    vote_text = run_bagel_vote(
-                        inferencer, grid_pil, vote_prompt,
-                        max_tokens=max_vote_tokens,
-                    )
-                    vote_info = game_generator.extract_vote(vote_text)
-                    game_votes.append(vote_info)
+                vote_texts = run_bagel_votes_cached(
+                    inferencer, grid_pil, vote_prompts,
+                    max_tokens=max_vote_tokens,
+                )
+            game_votes = [game_generator.extract_vote(vt) for vt in vote_texts]
+
             model.language_model = wrapped_lm  # restore wrapped model
 
             t_vote_total += time.time() - t_vote_start

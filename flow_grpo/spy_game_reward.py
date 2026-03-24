@@ -117,6 +117,50 @@ def run_bagel_vote(inferencer, grid_image: Image.Image, vote_prompt: str,
     return str(output)
 
 
+def run_bagel_votes_cached(inferencer, grid_image: Image.Image,
+                           vote_prompts: List[str],
+                           max_tokens: int = 512,
+                           temperature: float = 0.7) -> List[str]:
+    """Run multiple votes on the same grid image, caching ViT encoding.
+
+    Encodes the grid image once with ViT, then reuses the image KV cache
+    for each vote prompt. ~N× faster than calling run_bagel_vote N times.
+
+    Args:
+        inferencer: Bagel InterleaveInferencer.
+        grid_image: Grid PIL image (same for all voters).
+        vote_prompts: List of vote prompts (one per voter).
+        max_tokens: Max tokens for each vote response.
+        temperature: Sampling temperature.
+
+    Returns:
+        List of vote text strings.
+    """
+    from copy import deepcopy
+    from flow_grpo.bagel.data.data_utils import pil_img2rgb
+
+    results = []
+
+    with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+        # Step 1: Encode the grid image ONCE into a base context
+        base_context = inferencer.init_gen_context()
+        transformed_img = inferencer.vae_transform.resize_transform(pil_img2rgb(grid_image))
+        base_context = inferencer.update_context_image(
+            transformed_img, base_context, vae=False)  # understanding mode: vit only
+
+        # Step 2: For each voter, clone base context + encode text + generate
+        for prompt in vote_prompts:
+            # Clone the image-encoded context (avoids re-encoding image)
+            vote_context = deepcopy(base_context)
+            vote_context = inferencer.update_context_text(prompt, vote_context)
+            gen_text = inferencer.gen_text(
+                vote_context, do_sample=True,
+                temperature=temperature, max_length=max_tokens)
+            results.append(gen_text)
+
+    return results
+
+
 # ─── Advantages ──────────────────────────────────────────────────────────────
 
 def compute_group_advantages(flat_rewards: List[float], eps: float = 1e-4) -> torch.Tensor:
