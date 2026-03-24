@@ -479,8 +479,9 @@ def main(_):
             ]
             # Batch generate: all my_player_ids in one packed forward pass
             my_prompts = [prompts[pid] for pid in my_player_ids]
+            # model is the Bagel model with unwrapped language_model (set earlier)
             batch_results = batch_generate_images(
-                model=accelerator.unwrap_model(transformer).to(accelerator.device) if hasattr(transformer, 'module') else model,
+                model=model,
                 vae_model=vae_model,
                 tokenizer=tokenizer,
                 new_token_ids=new_token_ids,
