@@ -259,6 +259,8 @@ class SpyGameDataGenerator:
             )
 
         spy_player = game_data["spy_player"]
+        my_desc = game_data["player_descriptions"][player_id - 1]
+
         if player_id == spy_player:
             role_block = (
                 f'Your role: SPY (your description was different)\n'
@@ -293,6 +295,8 @@ class SpyGameDataGenerator:
             f'Now this is the decision-making stage. '
             f'Your task is to vote on who is the Odd Player.\n\n'
             f'{role_block}\n\n'
+            f'Your scene description (used to generate your image) was:\n'
+            f'"{my_desc}"\n\n'
             f'Game Instructions:\n'
             f'• There are {N} players in total. Only one player (the spy) had a different description.\n'
             f'• The player voted as the odd player will be severely punished. '
