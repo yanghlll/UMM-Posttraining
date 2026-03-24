@@ -398,11 +398,11 @@ def main(_):
             prompt_type=prompt_type,
             num_players=num_players,
         )
-    logger.info(f"  Game data: prompt_type={prompt_type}")
-    logger.info(f"  Role advantage: {'ENABLED' if use_role_advantage else 'DISABLED'}")
     max_vote_tokens = spy_cfg.get('max_vote_tokens', 512)
     num_inner_epochs = config.train.num_inner_epochs
     use_role_advantage = spy_cfg.get('use_role_advantage', False)
+    logger.info(f"  Game data: prompt_type={prompt_type}")
+    logger.info(f"  Role advantage: {'ENABLED' if use_role_advantage else 'DISABLED'}")
 
     # ==================== TRAINING LOOP ====================
     logger.info("***** Running Bagel Spy-Civ Flow-GRPO Training *****")
@@ -448,6 +448,9 @@ def main(_):
             ]
 
             # ── Phase 1: Each player generates an image ──────────
+            # Use unwrapped model for sampling (DDP wrapping breaks .model access)
+            wrapped_lm_gen = model.language_model
+            model.language_model = accelerator.unwrap_model(transformer)
             t_gen_start = time.time()
             player_trajs = []
             player_images_tensor = []
@@ -472,6 +475,7 @@ def main(_):
                     })
                     player_images_tensor.append(output_dict['image'])
 
+            model.language_model = wrapped_lm_gen  # restore for training later
             t_gen_total += time.time() - t_gen_start
 
             # Build voting grid on GPU (no CPU transfer), convert to PIL once
@@ -482,6 +486,10 @@ def main(_):
                                            cell_size=config.resolution)
 
             # ── Phase 2: Voting (Bagel understanding mode) ───────
+            # Temporarily use unwrapped model for voting (DDP/FSDP wrapping
+            # breaks generate_text() which accesses .model.embed_tokens directly)
+            wrapped_lm = model.language_model
+            model.language_model = accelerator.unwrap_model(transformer)
             game_votes = []
             with torch.no_grad():
                 for pid in range(1, num_players + 1):
@@ -492,6 +500,7 @@ def main(_):
                     )
                     vote_info = game_generator.extract_vote(vote_text)
                     game_votes.append(vote_info)
+            model.language_model = wrapped_lm  # restore wrapped model
 
             t_vote_total += time.time() - t_vote_start
 
