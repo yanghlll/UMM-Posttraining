@@ -459,9 +459,10 @@ def main(_):
         my_player_ids = [pid for pid in range(num_players) if pid % n_gpus == rank]
 
         # ================================================================
-        # BATCHED PHASE 1: Generate ALL games × my players (no sync)
-        # Each GPU generates its assigned players for ALL G games at once.
-        # Only 1 all_reduce at the end instead of G all_reduces.
+        # BATCHED PHASE 1: Generate ALL G games × my players in ONE batch
+        # Each rank collects G prompts (one per game for its assigned player)
+        # and generates them all in a single packed batch forward pass.
+        # batch_size = G × len(my_player_ids) per rank.
         # ================================================================
         t_gen_start = time.time()
         all_my_trajs = []   # [G] dict mapping pid -> traj
@@ -471,21 +472,25 @@ def main(_):
         for g in range(G):
             all_game_data_list.append(game_generator.generate_game(epoch * G + g, global_step))
 
-        for g in range(G):
-            game_data = all_game_data_list[g]
-            prompts = [
-                game_generator.format_generation_prompt_simple(game_data, pid)
-                for pid in range(1, num_players + 1)
-            ]
-            # Batch generate: all my_player_ids in one packed forward pass
-            my_prompts = [prompts[pid] for pid in my_player_ids]
-            # model is the Bagel model with unwrapped language_model (set earlier)
+        # Collect ALL prompts across G games for my assigned players
+        # Order: [game0_pid0, game1_pid0, game2_pid0, game3_pid0, game0_pid1, ...]
+        all_batch_prompts = []
+        batch_index_map = []  # (game_idx, pid) for each prompt in batch
+        for pid in my_player_ids:
+            for g in range(G):
+                game_data = all_game_data_list[g]
+                prompt = game_generator.format_generation_prompt_simple(game_data, pid)
+                all_batch_prompts.append(prompt)
+                batch_index_map.append((g, pid))
+
+        # Single batch generation: batch_size = G * len(my_player_ids)
+        if all_batch_prompts:
             batch_results = batch_generate_images(
                 model=model,
                 vae_model=vae_model,
                 tokenizer=tokenizer,
                 new_token_ids=new_token_ids,
-                prompts=my_prompts,
+                prompts=all_batch_prompts,
                 grpo_config=config,
                 resolution=config.resolution,
                 cfg_text_scale=config.sample.guidance_scale,
@@ -498,13 +503,16 @@ def main(_):
                 noise_level=config.sample.noise_level,
                 process_index=rank,
             )
-            my_trajs_g = {}
-            my_images_g = {}
-            for i, pid in enumerate(my_player_ids):
-                my_trajs_g[pid] = batch_results[i]
-                my_images_g[pid] = batch_results[i]['image']
-            all_my_trajs.append(my_trajs_g)
-            all_my_images.append(my_images_g)
+        else:
+            batch_results = []
+
+        # Unpack batch results back into [G][pid] structure
+        for g in range(G):
+            all_my_trajs.append({})
+            all_my_images.append({})
+        for batch_idx, (g, pid) in enumerate(batch_index_map):
+            all_my_trajs[g][pid] = batch_results[batch_idx]
+            all_my_images[g][pid] = batch_results[batch_idx]['image']
 
         # SINGLE all_reduce for ALL G games' images at once: [G, N, 3, H, W]
         first_img = list(all_my_images[0].values())[0]
