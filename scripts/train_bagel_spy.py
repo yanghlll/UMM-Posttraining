@@ -349,29 +349,19 @@ def main(_):
     G = spy_cfg.group_size
     num_inner_epochs = config.train.num_inner_epochs
 
-    # grad_accum = backward calls per real optimizer step PER RANK
-    # With cross-GPU parallelism, each rank trains ceil(N/n_gpus) players per game.
-    # Total per rank = G * ceil(N/n_gpus) * sde_window_size
-    # We set this after accelerator init since we need n_gpus.
-    # For now use a placeholder; will be adjusted after accelerator init.
-    grad_accum_placeholder = config.train.gradient_accumulation_steps * num_players * config.sample.sde_window_size
+    # grad_accum = total backward calls per real optimizer step per rank
+    # Each rank runs G games × N players × sde_window_size backward calls
+    # (each rank runs complete games independently in DDP mode)
+    grad_accum = config.train.gradient_accumulation_steps * num_players * config.sample.sde_window_size
 
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
-        gradient_accumulation_steps=grad_accum_placeholder,
+        gradient_accumulation_steps=grad_accum,
     )
     if hasattr(accelerator.state, 'fsdp_plugin') and accelerator.state.fsdp_plugin is not None:
         accelerator.state.fsdp_plugin.activation_checkpointing = config.activation_checkpointing
         accelerator.state.fsdp_plugin.transformer_cls_names_to_wrap = ['Qwen2MoTDecoderLayer']
-
-    # Recompute grad_accum with actual n_gpus for parallel training
-    n_gpus = accelerator.num_processes
-    import math as _math
-    players_per_rank = _math.ceil(num_players / n_gpus)
-    grad_accum = config.train.gradient_accumulation_steps * players_per_rank * config.sample.sde_window_size
-    # Override accelerator's setting
-    accelerator.gradient_accumulation_steps = grad_accum
 
     if accelerator.is_main_process:
         wandb.init(project="flow_grpo_spy", name=config.run_name, config=config.to_dict())
@@ -446,6 +436,7 @@ def main(_):
     for module in model.modules():
         remove_hook_from_module(module)
     model = model.eval()
+    torch.cuda.empty_cache()
 
     vae_model.requires_grad_(False)
     model.requires_grad_(False)
@@ -549,6 +540,9 @@ def main(_):
     batch_time_start = time.time()
 
     for epoch in range(config.num_epochs):
+        # Free GPU memory from previous epoch
+        torch.cuda.empty_cache()
+
         # ── Eval & Checkpoint ────────────────────────────────────
         if not config.debug and epoch > 0 and epoch % config.save_freq == 0:
             save_fsdp_checkpoint(config.save_dir, transformer, global_step,
@@ -566,160 +560,83 @@ def main(_):
         epoch_civ_rewards = []
         t_gen_total, t_vote_total = 0.0, 0.0
 
-        # Use unwrapped model for all inference (DDP wrapping breaks .model access)
+        # ================================================================
+        # Each rank runs complete games independently (DDP style).
+        # Image generation: serial batch=1 (each player knows own role only)
+        # Voting: batch=N (all N players vote simultaneously on same grid)
+        # No cross-GPU sync needed for game data — each rank has own games.
+        # ================================================================
         wrapped_lm_save = model.language_model
         model.language_model = accelerator.unwrap_model(transformer)
 
-        rank = accelerator.process_index
-        n_gpus = accelerator.num_processes
-        my_player_ids = [pid for pid in range(num_players) if pid % n_gpus == rank]
+        for g in tqdm(range(G), desc=f"Epoch {epoch}: games",
+                      disable=not accelerator.is_local_main_process):
 
-        # ================================================================
-        # BATCHED PHASE 1: Generate ALL G games × my players in ONE batch
-        # Each rank collects G prompts (one per game for its assigned player)
-        # and generates them all in a single packed batch forward pass.
-        # batch_size = G × len(my_player_ids) per rank.
-        # ================================================================
-        t_gen_start = time.time()
-        all_my_trajs = []   # [G] dict mapping pid -> traj
-        all_my_images = []  # [G] dict mapping pid -> image tensor
+            game_data = game_generator.generate_game(
+                epoch * G * accelerator.num_processes + g * accelerator.num_processes + accelerator.process_index,
+                global_step)
+            all_game_data_list.append(game_data)
 
-        # Pre-generate all game data
-        for g in range(G):
-            all_game_data_list.append(game_generator.generate_game(epoch * G + g, global_step))
+            prompts = [
+                game_generator.format_generation_prompt_simple(game_data, pid)
+                for pid in range(1, num_players + 1)
+            ]
 
-        # Collect ALL prompts across G games for my assigned players
-        # Order: [game0_pid0, game1_pid0, game2_pid0, game3_pid0, game0_pid1, ...]
-        all_batch_prompts = []
-        batch_index_map = []  # (game_idx, pid) for each prompt in batch
-        for pid in my_player_ids:
-            for g in range(G):
-                game_data = all_game_data_list[g]
-                prompt = game_generator.format_generation_prompt_simple(game_data, pid)
-                all_batch_prompts.append(prompt)
-                batch_index_map.append((g, pid))
+            # ── Phase 1: Serial image generation (batch=1 per player) ──
+            t_gen_start = time.time()
+            player_trajs = []
+            player_images_tensor = []
 
-        # Single batch generation: batch_size = G * len(my_player_ids)
-        if all_batch_prompts:
-            batch_results = batch_generate_images(
-                model=model,
-                vae_model=vae_model,
-                tokenizer=tokenizer,
-                new_token_ids=new_token_ids,
-                prompts=all_batch_prompts,
-                grpo_config=config,
-                resolution=config.resolution,
-                cfg_text_scale=config.sample.guidance_scale,
-                cfg_img_scale=inference_hyper.get('cfg_img_scale', 1.0),
-                cfg_interval=inference_hyper.get('cfg_interval', [0, 1.0]),
-                cfg_renorm_min=inference_hyper.get('cfg_renorm_min', 0.0),
-                cfg_renorm_type=inference_hyper.get('cfg_renorm_type', 'global'),
-                timestep_shift=inference_hyper.get('timestep_shift', 3.0),
-                num_timesteps=config.sample.num_steps,
-                noise_level=config.sample.noise_level,
-                process_index=rank,
-            )
-        else:
-            batch_results = []
+            with autocast():
+                for pid in range(num_players):
+                    with torch.no_grad():
+                        output_dict = inferencer(
+                            text=prompts[pid],
+                            noise_level=config.sample.noise_level,
+                            grpo_config=config,
+                            accelerator=accelerator,
+                            num_timesteps=config.sample.num_steps,
+                            cfg_text_scale=config.sample.guidance_scale,
+                            **inference_hyper,
+                        )
+                    player_trajs.append({
+                        'image': output_dict['image'],
+                        'all_latents': output_dict['all_latents'],
+                        'all_log_probs': output_dict['all_log_probs'],
+                        'timesteps': output_dict['timesteps'],
+                    })
+                    player_images_tensor.append(output_dict['image'])
 
-        # Unpack batch results back into [G][pid] structure
-        for g in range(G):
-            all_my_trajs.append({})
-            all_my_images.append({})
-        for batch_idx, (g, pid) in enumerate(batch_index_map):
-            all_my_trajs[g][pid] = batch_results[batch_idx]
-            all_my_images[g][pid] = batch_results[batch_idx]['image']
+            t_gen_total += time.time() - t_gen_start
 
-        # SINGLE all_reduce for ALL G games' images at once: [G, N, 3, H, W]
-        first_img = list(all_my_images[0].values())[0]
-        img_shape = list(first_img.shape)
-        all_images_packed = torch.zeros(G, num_players, *img_shape,
-                                        device=accelerator.device, dtype=torch.bfloat16)
-        for g in range(G):
-            for pid in my_player_ids:
-                all_images_packed[g, pid] = all_my_images[g][pid]
-        torch.distributed.all_reduce(all_images_packed, op=torch.distributed.ReduceOp.SUM)
-
-        t_gen_total = time.time() - t_gen_start
-
-        # ================================================================
-        # BATCHED PHASE 2: Vote ALL games × my votes in ONE batch call
-        # Collect all G grid images + prompts, batch generate all votes
-        # at once with batch=G autoregressive decoding.
-        # ================================================================
-        t_vote_start = time.time()
-        all_vote_tensors = torch.full((G, num_players), -2,
-                                       device=accelerator.device, dtype=torch.long)
-
-        # Collect all grid images and vote prompts for batch generation
-        all_grid_pils = []
-        all_vote_prompts_flat = []
-        vote_index_map = []  # (g, pid) for each entry
-
-        for g in range(G):
-            game_data = all_game_data_list[g]
-            player_images_g = [all_images_packed[g, pid] for pid in range(num_players)]
-            grid_tensor = build_voting_grid_tensor(player_images_g,
+            # ── Phase 2: Batch voting (batch=N, all players vote at once) ──
+            t_vote_start = time.time()
+            grid_tensor = build_voting_grid_tensor(player_images_tensor,
                                                     cell_size=config.resolution)
             grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
                                            cell_size=config.resolution)
-            for pid in my_player_ids:
-                all_grid_pils.append(grid_pil)
-                all_vote_prompts_flat.append(
-                    game_generator.format_voting_prompt(game_data, player_id=pid + 1))
-                vote_index_map.append((g, pid))
 
-        # Single batch vote call: batch=G*players_per_rank
-        if all_vote_prompts_flat:
-            unwrapped_model = accelerator.unwrap_model(transformer)
+            # Collect all N vote prompts for this game
+            vote_prompts = [
+                game_generator.format_voting_prompt(game_data, player_id=pid)
+                for pid in range(1, num_players + 1)
+            ]
+            # Batch vote: all N players in one autoregressive pass
             vote_texts = run_bagel_votes_batch(
                 model=model,
                 tokenizer=tokenizer,
                 new_token_ids=new_token_ids,
                 vit_transform=vit_transform,
-                grid_images=all_grid_pils,
-                vote_prompts=all_vote_prompts_flat,
+                grid_images=[grid_pil] * num_players,
+                vote_prompts=vote_prompts,
                 max_tokens=max_vote_tokens,
                 temperature=0.7,
             )
-        else:
-            vote_texts = []
+            game_votes = [game_generator.extract_vote(vt) for vt in vote_texts]
 
-        # Unpack vote results
-        for idx, (g, pid) in enumerate(vote_index_map):
-            vote_info = game_generator.extract_vote(vote_texts[idx])
-            if vote_info is None:
-                all_vote_tensors[g, pid] = -1
-            elif vote_info.get('voted_spy') == 'N/A':
-                all_vote_tensors[g, pid] = 0
-            else:
-                all_vote_tensors[g, pid] = vote_info.get('voted_spy', -1)
+            t_vote_total += time.time() - t_vote_start
 
-        # SINGLE all_reduce for ALL G games' votes
-        torch.distributed.all_reduce(all_vote_tensors, op=torch.distributed.ReduceOp.MAX)
-
-        t_vote_total = time.time() - t_vote_start
-
-        # ================================================================
-        # Phase 3: Compute rewards for all G games (CPU, fast)
-        # ================================================================
-        for g in range(G):
-            game_data = all_game_data_list[g]
-            player_images_tensor = [all_images_packed[g, pid] for pid in range(num_players)]
-
-            # Decode votes
-            game_votes = []
-            for pid in range(num_players):
-                v = all_vote_tensors[g, pid].item()
-                if v == -1:
-                    game_votes.append(None)
-                elif v == 0:
-                    game_votes.append({'voted_spy': 'N/A'})
-                elif v > 0:
-                    game_votes.append({'voted_spy': v})
-                else:
-                    game_votes.append(None)
-
+            # ── Phase 3: Compute rewards ──
             game_outcome = game_generator.calculate_game_rewards(game_data, game_votes)
             gen_rewards = game_generator.compute_generation_rewards(game_outcome)
 
@@ -736,14 +653,6 @@ def main(_):
             civ_rs = [gen_rewards[i] for i in range(num_players) if i != spy_pid - 1]
             game_generator.update_baselines(gen_rewards[spy_pid - 1],
                                             np.mean(civ_rs) if civ_rs else 0.0)
-
-            # Build player_trajs for training
-            player_trajs = [None] * num_players
-            for pid in range(num_players):
-                if pid in all_my_trajs[g]:
-                    player_trajs[pid] = all_my_trajs[g][pid]
-                else:
-                    player_trajs[pid] = {'image': player_images_tensor[pid]}
 
             all_game_trajs.append(player_trajs)
             all_game_rewards.append(gen_rewards)
@@ -836,92 +745,66 @@ def main(_):
         #     gradient_accumulation_steps (set to large value so they're no-ops)
         #   - After all backward calls, we manually all-reduce + step
 
-        # Temporarily set huge grad_accum so accelerator never auto-steps
-        saved_grad_accum = accelerator.gradient_accumulation_steps
-        accelerator.gradient_accumulation_steps = 999999
-
-        no_sync_ctx = transformer.no_sync if hasattr(transformer, 'no_sync') else contextlib.nullcontext
         info = defaultdict(list)
 
         for inner_epoch in range(num_inner_epochs):
             adv_idx = 0
+            for g in range(G):
+                prompts = all_game_prompts[g]
 
-            with no_sync_ctx():
-                for g in range(G):
-                    prompts = all_game_prompts[g]
+                for pid in range(num_players):
+                    ptraj = all_game_trajs[g][pid]
+                    latents = torch.stack(ptraj['all_latents'])
+                    log_probs = torch.stack(ptraj['all_log_probs'])
+                    timesteps = ptraj['timesteps']
 
-                    for pid in range(num_players):
-                        has_traj = (pid % n_gpus == rank) and ('all_latents' in all_game_trajs[g][pid])
+                    cur_sample = {
+                        'timesteps': timesteps,
+                        'latents': latents[:-1],
+                        'prev_latents': latents[1:],
+                        'log_probs': log_probs,
+                        'advantages': advantages[adv_idx].unsqueeze(0).expand(
+                            timesteps.shape[0], -1) if advantages.dim() > 0
+                            else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
+                            timesteps.shape[0], 1),
+                    }
+                    cur_sample['dtimesteps'] = torch.cat([
+                        timesteps[:-1] - timesteps[1:],
+                        timesteps[-1:],
+                    ])
 
-                        if has_traj:
-                            ptraj = all_game_trajs[g][pid]
-                            latents = torch.stack(ptraj['all_latents'])
-                            log_probs = torch.stack(ptraj['all_log_probs'])
-                            timesteps = ptraj['timesteps']
+                    with autocast():
+                        output_dict = inferencer(
+                            text=prompts[pid],
+                            noise_level=config.sample.noise_level,
+                            learn=True,
+                            sample=cur_sample,
+                            grpo_config=config,
+                            accelerator=accelerator,
+                            optimizer=optimizer,
+                            transformer=transformer,
+                            num_timesteps=config.sample.num_steps,
+                            cfg_text_scale=config.sample.guidance_scale,
+                            **inference_hyper,
+                        )
 
-                            cur_sample = {
-                                'timesteps': timesteps,
-                                'latents': latents[:-1],
-                                'prev_latents': latents[1:],
-                                'log_probs': log_probs,
-                                'advantages': advantages[adv_idx].unsqueeze(0).expand(
-                                    timesteps.shape[0], -1) if advantages.dim() > 0
-                                    else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
-                                    timesteps.shape[0], 1),
-                            }
-                            cur_sample['dtimesteps'] = torch.cat([
-                                timesteps[:-1] - timesteps[1:],
-                                timesteps[-1:],
-                            ])
+                    info["clipfrac"].append(output_dict["clipfrac"])
+                    info["clipfrac_gt_one"].append(output_dict.get("clipfrac_gt_one", output_dict["clipfrac"]))
+                    info["clipfrac_lt_one"].append(output_dict.get("clipfrac_lt_one", output_dict["clipfrac"]))
+                    info["policy_loss"].append(output_dict["policy_loss"])
+                    info["kl_loss"].append(output_dict["kl_loss"])
+                    info["loss"].append(output_dict["loss"])
+                    adv_idx += 1
 
-                            with autocast():
-                                output_dict = inferencer(
-                                    text=prompts[pid],
-                                    noise_level=config.sample.noise_level,
-                                    learn=True,
-                                    sample=cur_sample,
-                                    grpo_config=config,
-                                    accelerator=accelerator,
-                                    optimizer=optimizer,
-                                    transformer=transformer,
-                                    num_timesteps=config.sample.num_steps,
-                                    cfg_text_scale=config.sample.guidance_scale,
-                                    **inference_hyper,
-                                )
-
-                            info["clipfrac"].append(output_dict["clipfrac"])
-                            info["clipfrac_gt_one"].append(output_dict.get("clipfrac_gt_one", output_dict["clipfrac"]))
-                            info["clipfrac_lt_one"].append(output_dict.get("clipfrac_lt_one", output_dict["clipfrac"]))
-                            info["policy_loss"].append(output_dict["policy_loss"])
-                            info["kl_loss"].append(output_dict["kl_loss"])
-                            info["loss"].append(output_dict["loss"])
-
-                        adv_idx += 1
-
-            # ── ONE gradient sync + optimizer step per inner epoch ──
-            if n_gpus > 1:
-                for param in transformer.parameters():
-                    if param.grad is not None:
-                        torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
-
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in transformer.parameters() if p.grad is not None],
-                config.train.max_grad_norm or 1.0,
-            )
-            optimizer.step()
-            optimizer.zero_grad()
-
-            if info["loss"] and accelerator.is_main_process:
-                log_info = {k: torch.mean(torch.stack(v)).item()
-                            for k, v in info.items()}
-                log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
-                log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                wandb.log(log_info, step=global_step)
-            global_step += 1
-            info = defaultdict(list)
-
-        # Restore original grad_accum
-        accelerator.gradient_accumulation_steps = saved_grad_accum
+                    if accelerator.sync_gradients:
+                        if info["loss"] and accelerator.is_main_process:
+                            log_info = {k: torch.mean(torch.stack(v)).item()
+                                        for k, v in info.items()}
+                            log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
+                            log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                            wandb.log(log_info, step=global_step)
+                        global_step += 1
+                        info = defaultdict(list)
 
     if accelerator.is_main_process:
         wandb.finish()
