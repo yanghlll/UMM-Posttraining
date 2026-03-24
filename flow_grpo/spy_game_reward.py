@@ -104,9 +104,44 @@ def tensor_images_to_pil(images: torch.Tensor) -> List[Image.Image]:
 
 def run_bagel_vote(inferencer, grid_image: Image.Image, vote_prompt: str,
                    max_tokens: int = 512, temperature: float = 0.7) -> str:
-    """Run Bagel understanding mode to vote on a grid image."""
+    """Run Bagel understanding mode to vote on a grid image (legacy, single grid)."""
     output = inferencer.interleave_inference(
         input_lists=[grid_image, vote_prompt],
+        understanding_output=True,
+        do_sample=True,
+        text_temperature=temperature,
+        max_think_token_n=max_tokens,
+    )
+    if isinstance(output, list) and len(output) > 0:
+        return output[0]
+    return str(output)
+
+
+def run_bagel_vote_multi_image(inferencer, player_images: List[Image.Image],
+                                vote_prompt: str,
+                                max_tokens: int = 512,
+                                temperature: float = 0.7) -> str:
+    """Run Bagel understanding mode with separate images for each player.
+
+    Instead of a single grid image, passes each player's image separately
+    with text labels, so the model clearly knows which image is which player.
+
+    Args:
+        inferencer: Bagel InterleaveInferencer.
+        player_images: List of N PIL images, one per player (0-indexed).
+        vote_prompt: Voting prompt text (appended after all images).
+        max_tokens: Max tokens for vote response.
+        temperature: Sampling temperature.
+    """
+    # Build interleaved input: [label, image, label, image, ..., vote_prompt]
+    input_lists = []
+    for i, img in enumerate(player_images):
+        input_lists.append(f"Player {i+1}'s generated image:")
+        input_lists.append(img)
+    input_lists.append(vote_prompt)
+
+    output = inferencer.interleave_inference(
+        input_lists=input_lists,
         understanding_output=True,
         do_sample=True,
         text_temperature=temperature,

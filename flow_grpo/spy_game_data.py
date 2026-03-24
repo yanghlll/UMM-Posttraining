@@ -237,21 +237,13 @@ class SpyGameDataGenerator:
 
         if player_id is None:
             # God judge perspective
-            if N == 4:
-                layout = ('The image shows a 2×2 grid of 4 generated images:\n'
-                          '• Top-left = Player 1\'s image\n'
-                          '• Top-right = Player 2\'s image\n'
-                          '• Bottom-left = Player 3\'s image\n'
-                          '• Bottom-right = Player 4\'s image')
-            else:
-                layout = f'The image shows {N} generated images labeled Player 1 through Player {N}.'
-
             return (
                 f'You are analyzing a game of "Who\'s the Odd One Out?" where '
                 f'{N} players each generated an image from a scene description. '
                 f'One player (the spy) received a slightly different description, '
                 f'so their generated image should look subtly different.\n\n'
-                f'{layout}\n\n'
+                f'You can see all {N} players\' generated images above, '
+                f'labeled "Player 1\'s generated image" through "Player {N}\'s generated image".\n\n'
                 f'What you should do:\n'
                 f'1. Compare all {N} images carefully.\n'
                 f'2. Look for objects that appear different in one image compared to the others.\n'
@@ -295,16 +287,6 @@ class SpyGameDataGenerator:
                 f'There is a reward for voting correctly.'
             )
 
-        # Tell model the grid layout so it knows which image is which player
-        if N == 4:
-            layout = ('The image shows a 2×2 grid of 4 generated images:\n'
-                      '• Top-left = Player 1\'s image\n'
-                      '• Top-right = Player 2\'s image\n'
-                      '• Bottom-left = Player 3\'s image\n'
-                      '• Bottom-right = Player 4\'s image')
-        else:
-            layout = f'The image shows {N} generated images labeled Player 1 through Player {N}.'
-
         return (
             f'You are PLAYER {player_id} of the game "Who\'s the Odd One Out?". '
             f'Each player generated an image from a scene description. '
@@ -315,8 +297,8 @@ class SpyGameDataGenerator:
             f'• There are {N} players in total. Only one player (the spy) had a different description.\n'
             f'• The player voted as the odd player will be severely punished. '
             f'Therefore all players will try to convince others that they are not the odd player.\n'
-            f'• The spy\'s image may have different objects or attributes compared to the majority.\n\n'
-            f'{layout}\n\n'
+            f'• The spy\'s image may have different objects or attributes compared to the majority.\n'
+            f'• You can see all {N} players\' generated images above, labeled "Player 1\'s generated image" through "Player {N}\'s generated image".\n\n'
             f'{action_block}\n\n'
             f'Required output format:\n'
             f'<think>\n'

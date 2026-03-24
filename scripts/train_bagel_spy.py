@@ -39,8 +39,9 @@ from flow_grpo.bagel.inferencer import InterleaveInferencer
 from flow_grpo.spy_game_data import SpyGameDataGenerator, TextFileGameDataGenerator
 from flow_grpo.spy_game_reward import (
     build_voting_grid, build_voting_grid_tensor, grid_tensor_to_pil,
-    tensor_images_to_pil, run_bagel_vote, run_bagel_votes_cached,
-    run_bagel_votes_batch, compute_group_advantages, batch_generate_images,
+    tensor_images_to_pil, run_bagel_vote, run_bagel_vote_multi_image,
+    run_bagel_votes_cached, run_bagel_votes_batch,
+    compute_group_advantages, batch_generate_images,
 )
 
 import numpy as np
@@ -611,30 +612,21 @@ def main(_):
 
             t_gen_total += time.time() - t_gen_start
 
-            # ── Phase 2: Batch voting (batch=N, all players vote at once) ──
+            # ── Phase 2: Voting (separate images per player, serial) ──
             t_vote_start = time.time()
-            grid_tensor = build_voting_grid_tensor(player_images_tensor,
-                                                    cell_size=config.resolution)
-            grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
-                                           cell_size=config.resolution)
 
-            # Collect all N vote prompts for this game
-            vote_prompts = [
-                game_generator.format_voting_prompt(game_data, player_id=pid)
-                for pid in range(1, num_players + 1)
-            ]
-            # Batch vote: all N players in one autoregressive pass
-            vote_texts = run_bagel_votes_batch(
-                model=model,
-                tokenizer=tokenizer,
-                new_token_ids=new_token_ids,
-                vit_transform=vit_transform,
-                grid_images=[grid_pil] * num_players,
-                vote_prompts=vote_prompts,
-                max_tokens=max_vote_tokens,
-                temperature=0.7,
-            )
-            game_votes = [game_generator.extract_vote(vt) for vt in vote_texts]
+            # Convert tensor images to PIL for understanding mode
+            pil_images = tensor_images_to_pil(torch.stack(player_images_tensor))
+
+            game_votes = []
+            with torch.no_grad():
+                for pid in range(1, num_players + 1):
+                    vote_prompt = game_generator.format_voting_prompt(game_data, player_id=pid)
+                    vote_text = run_bagel_vote_multi_image(
+                        inferencer, pil_images, vote_prompt,
+                        max_tokens=max_vote_tokens, temperature=0.7,
+                    )
+                    game_votes.append(game_generator.extract_vote(vote_text))
 
             t_vote_total += time.time() - t_vote_start
 
