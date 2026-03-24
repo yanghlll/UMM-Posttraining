@@ -454,29 +454,33 @@ def main(_):
         wrapped_lm_save = model.language_model
         model.language_model = accelerator.unwrap_model(transformer)
 
-        for g in tqdm(range(G), desc=f"Epoch {epoch}: games",
-                      disable=not accelerator.is_local_main_process):
+        rank = accelerator.process_index
+        n_gpus = accelerator.num_processes
+        my_player_ids = [pid for pid in range(num_players) if pid % n_gpus == rank]
 
-            game_data = game_generator.generate_game(epoch * G + g, global_step)
-            prompts = [
-                game_generator.format_generation_prompt_simple(game_data, pid)
-                for pid in range(1, num_players + 1)
-            ]
+        # ================================================================
+        # BATCHED PHASE 1: Generate ALL games × my players (no sync)
+        # Each GPU generates its assigned players for ALL G games at once.
+        # Only 1 all_reduce at the end instead of G all_reduces.
+        # ================================================================
+        t_gen_start = time.time()
+        all_my_trajs = []   # [G] dict mapping pid -> traj
+        all_my_images = []  # [G] dict mapping pid -> image tensor
 
-            # ── Phase 1: Each GPU generates 1 player's image (parallel) ──
-            # With N=4 players and 4 GPUs, each GPU handles 1 player.
-            # With more/fewer GPUs, players are round-robin assigned.
-            t_gen_start = time.time()
-            rank = accelerator.process_index
-            n_gpus = accelerator.num_processes
+        # Pre-generate all game data
+        for g in range(G):
+            all_game_data_list.append(game_generator.generate_game(epoch * G + g, global_step))
 
-            # Each GPU generates its assigned players
-            my_pids = [pid for pid in range(num_players) if pid % n_gpus == rank]
-            my_trajs = {}
-            my_images = {}
-
-            with autocast():
-                for pid in my_pids:
+        with autocast():
+            for g in range(G):
+                game_data = all_game_data_list[g]
+                prompts = [
+                    game_generator.format_generation_prompt_simple(game_data, pid)
+                    for pid in range(1, num_players + 1)
+                ]
+                my_trajs_g = {}
+                my_images_g = {}
+                for pid in my_player_ids:
                     with torch.no_grad():
                         output_dict = inferencer(
                             text=prompts[pid],
@@ -487,85 +491,76 @@ def main(_):
                             cfg_text_scale=config.sample.guidance_scale,
                             **inference_hyper,
                         )
-                    my_trajs[pid] = {
+                    my_trajs_g[pid] = {
                         'image': output_dict['image'],
                         'all_latents': output_dict['all_latents'],
                         'all_log_probs': output_dict['all_log_probs'],
                         'timesteps': output_dict['timesteps'],
                     }
-                    my_images[pid] = output_dict['image']
+                    my_images_g[pid] = output_dict['image']
+                all_my_trajs.append(my_trajs_g)
+                all_my_images.append(my_images_g)
 
-            # All-gather images across GPUs so every rank has all N images
-            # Pack into a tensor: [num_players, 3, H, W]
-            img_shape = list(my_images[my_pids[0]].shape) if my_pids else [3, config.resolution, config.resolution]
-            all_images_local = torch.zeros(num_players, *img_shape, device=accelerator.device, dtype=torch.bfloat16)
-            for pid in my_pids:
-                all_images_local[pid] = my_images[pid]
-            # Sum across ranks (each rank contributed its assigned slots, others are zero)
-            torch.distributed.all_reduce(all_images_local, op=torch.distributed.ReduceOp.SUM)
+        # SINGLE all_reduce for ALL G games' images at once: [G, N, 3, H, W]
+        first_img = list(all_my_images[0].values())[0]
+        img_shape = list(first_img.shape)
+        all_images_packed = torch.zeros(G, num_players, *img_shape,
+                                        device=accelerator.device, dtype=torch.bfloat16)
+        for g in range(G):
+            for pid in my_player_ids:
+                all_images_packed[g, pid] = all_my_images[g][pid]
+        torch.distributed.all_reduce(all_images_packed, op=torch.distributed.ReduceOp.SUM)
 
-            player_images_tensor = [all_images_local[pid] for pid in range(num_players)]
+        t_gen_total = time.time() - t_gen_start
 
-            # Also gather trajectories: each rank needs all trajectories for training
-            # For trajectories, we gather via broadcast from the generating rank
-            player_trajs = [None] * num_players
-            for pid in range(num_players):
-                src_rank = pid % n_gpus
-                if src_rank == rank:
-                    player_trajs[pid] = my_trajs[pid]
-                else:
-                    # Receive trajectory data from src_rank
-                    # We need latents, log_probs, timesteps
-                    # Use all_reduce: src has data, others have zeros
-                    pass  # trajectories only needed on each rank for its own training
+        # ================================================================
+        # BATCHED PHASE 2: Vote ALL games × my votes (no sync)
+        # Each GPU votes for its assigned players across ALL G games.
+        # Only 1 all_reduce at the end.
+        # ================================================================
+        t_vote_start = time.time()
+        all_vote_tensors = torch.full((G, num_players), -2,
+                                       device=accelerator.device, dtype=torch.long)
 
-            # For training, each rank only needs its own players' trajectories
-            # Fill in other players' trajs with just the image (for metrics)
-            for pid in range(num_players):
-                if player_trajs[pid] is None:
-                    player_trajs[pid] = {'image': player_images_tensor[pid]}
+        with torch.no_grad():
+            for g in range(G):
+                game_data = all_game_data_list[g]
+                player_images_g = [all_images_packed[g, pid] for pid in range(num_players)]
+                grid_tensor = build_voting_grid_tensor(player_images_g,
+                                                        cell_size=config.resolution)
+                grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
+                                               cell_size=config.resolution)
 
-            t_gen_total += time.time() - t_gen_start
-
-            # ── Phase 2: Voting (only rank 0, then broadcast results) ──
-            t_vote_start = time.time()
-            grid_tensor = build_voting_grid_tensor(player_images_tensor,
-                                                    cell_size=config.resolution)
-            grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
-                                           cell_size=config.resolution)
-
-            vote_prompts = [
-                game_generator.format_voting_prompt(game_data, player_id=pid)
-                for pid in range(1, num_players + 1)
-            ]
-            # Every rank votes (same images, same prompts, but independent results)
-            # Each rank handles a subset of votes
-            my_vote_pids = [pid for pid in range(num_players) if pid % n_gpus == rank]
-            vote_texts_local = [''] * num_players
-            with torch.no_grad():
-                for pid in my_vote_pids:
-                    vote_texts_local[pid] = run_bagel_vote(
-                        inferencer, grid_pil, vote_prompts[pid],
+                for pid in my_player_ids:
+                    vote_prompt = game_generator.format_voting_prompt(game_data, player_id=pid + 1)
+                    vote_text = run_bagel_vote(
+                        inferencer, grid_pil, vote_prompt,
                         max_tokens=max_vote_tokens,
                     )
+                    vote_info = game_generator.extract_vote(vote_text)
+                    if vote_info is None:
+                        all_vote_tensors[g, pid] = -1
+                    elif vote_info.get('voted_spy') == 'N/A':
+                        all_vote_tensors[g, pid] = 0
+                    else:
+                        all_vote_tensors[g, pid] = vote_info.get('voted_spy', -1)
 
-            # Gather vote results: use a simple approach - broadcast vote info
-            # Pack votes as tensor of voted_spy values (-1 = invalid, 0 = N/A)
-            vote_tensor = torch.full((num_players,), -2, device=accelerator.device, dtype=torch.long)
-            for pid in my_vote_pids:
-                vote_info = game_generator.extract_vote(vote_texts_local[pid])
-                if vote_info is None:
-                    vote_tensor[pid] = -1
-                elif vote_info.get('voted_spy') == 'N/A':
-                    vote_tensor[pid] = 0
-                else:
-                    vote_tensor[pid] = vote_info.get('voted_spy', -1)
-            # All-reduce with MAX (each rank fills its slots, -2 means unfilled)
-            torch.distributed.all_reduce(vote_tensor, op=torch.distributed.ReduceOp.MAX)
+        # SINGLE all_reduce for ALL G games' votes
+        torch.distributed.all_reduce(all_vote_tensors, op=torch.distributed.ReduceOp.MAX)
 
+        t_vote_total = time.time() - t_vote_start
+
+        # ================================================================
+        # Phase 3: Compute rewards for all G games (CPU, fast)
+        # ================================================================
+        for g in range(G):
+            game_data = all_game_data_list[g]
+            player_images_tensor = [all_images_packed[g, pid] for pid in range(num_players)]
+
+            # Decode votes
             game_votes = []
             for pid in range(num_players):
-                v = vote_tensor[pid].item()
+                v = all_vote_tensors[g, pid].item()
                 if v == -1:
                     game_votes.append(None)
                 elif v == 0:
@@ -575,9 +570,6 @@ def main(_):
                 else:
                     game_votes.append(None)
 
-            t_vote_total += time.time() - t_vote_start
-
-            # ── Phase 3: Compute rewards ─────────────────────────
             game_outcome = game_generator.calculate_game_rewards(game_data, game_votes)
             gen_rewards = game_generator.compute_generation_rewards(game_outcome)
 
@@ -585,23 +577,28 @@ def main(_):
                 spy_caught_count += 1
             total_games += 1
 
-            # Track spy vs civilian rewards separately
             spy_pid = game_data['spy_player']
             epoch_spy_rewards.append(gen_rewards[spy_pid - 1])
             for i, r in enumerate(gen_rewards):
                 if i != spy_pid - 1:
                     epoch_civ_rewards.append(r)
 
-            # Update EMA baselines
             civ_rs = [gen_rewards[i] for i in range(num_players) if i != spy_pid - 1]
             game_generator.update_baselines(gen_rewards[spy_pid - 1],
                                             np.mean(civ_rs) if civ_rs else 0.0)
 
+            # Build player_trajs for training
+            player_trajs = [None] * num_players
+            for pid in range(num_players):
+                if pid in all_my_trajs[g]:
+                    player_trajs[pid] = all_my_trajs[g][pid]
+                else:
+                    player_trajs[pid] = {'image': player_images_tensor[pid]}
+
             all_game_trajs.append(player_trajs)
             all_game_rewards.append(gen_rewards)
-            all_game_images_t.append(player_images_tensor)  # keep tensors on GPU
+            all_game_images_t.append(player_images_tensor)
             all_game_votes.append(game_votes)
-            all_game_data_list.append(game_data)
             all_game_outcomes.append(game_outcome)
 
         # ── Group-relative advantages ────────────────────────────
