@@ -188,64 +188,57 @@ def batch_generate_images(model, vae_model, tokenizer, new_token_ids,
     N = len(prompts)
     device = next(model.parameters()).device
 
-    # ── Step 1: Encode all N prompts into packed KV cache ──
-    past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-    kv_lens = [0] * N
-    ropes = [0] * N
+    def _to_device(d):
+        for k, v in d.items():
+            if isinstance(v, torch.Tensor):
+                d[k] = v.to(device)
+        return d
 
-    generation_input, kv_lens, ropes = model.prepare_prompts(
-        curr_kvlens=kv_lens, curr_rope=ropes,
-        prompts=prompts, tokenizer=tokenizer,
-        new_token_ids=new_token_ids,
-    )
-    # Move to device
-    for k, v in generation_input.items():
-        if isinstance(v, torch.Tensor):
-            generation_input[k] = v.to(device)
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+        # ── Step 1: Encode all N prompts into packed KV cache ──
+        past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+        kv_lens = [0] * N
+        ropes = [0] * N
 
-    with torch.no_grad():
-        with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
-            past_key_values = model.forward_cache_update_text(
-                past_key_values, **generation_input)
+        generation_input, kv_lens, ropes = model.prepare_prompts(
+            curr_kvlens=kv_lens, curr_rope=ropes,
+            prompts=prompts, tokenizer=tokenizer,
+            new_token_ids=new_token_ids,
+        )
+        _to_device(generation_input)
+        past_key_values = model.forward_cache_update_text(
+            past_key_values, **generation_input)
 
-    # ── Step 2: Prepare N VAE latents ──
-    generation_input = model.prepare_vae_latent(
-        curr_kvlens=kv_lens, curr_rope=ropes,
-        image_sizes=[(resolution, resolution)] * N,
-        new_token_ids=new_token_ids,
-    )
-    for k, v in generation_input.items():
-        if isinstance(v, torch.Tensor):
-            generation_input[k] = v.to(device)
+        # ── Step 2: Prepare N VAE latents ──
+        generation_input = model.prepare_vae_latent(
+            curr_kvlens=kv_lens, curr_rope=ropes,
+            image_sizes=[(resolution, resolution)] * N,
+            new_token_ids=new_token_ids,
+        )
+        _to_device(generation_input)
 
-    # ── Step 3: Prepare text-CFG (unconditional) KV cache ──
-    cfg_text_past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-    cfg_kv_lens = [0] * N
-    cfg_ropes = [0] * N
-    generation_input_cfg_text = model.prepare_vae_latent_cfg(
-        curr_kvlens=cfg_kv_lens, curr_rope=cfg_ropes,
-        image_sizes=[(resolution, resolution)] * N,
-    )
-    for k, v in generation_input_cfg_text.items():
-        if isinstance(v, torch.Tensor):
-            generation_input_cfg_text[k] = v.to(device)
+        # ── Step 3: Prepare text-CFG (unconditional) KV cache ──
+        cfg_text_past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+        cfg_kv_lens = [0] * N
+        cfg_ropes = [0] * N
+        generation_input_cfg_text = model.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_kv_lens, curr_rope=cfg_ropes,
+            image_sizes=[(resolution, resolution)] * N,
+        )
+        _to_device(generation_input_cfg_text)
 
-    # ── Step 4: Prepare img-CFG KV cache ──
-    cfg_img_past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
-    cfg_img_kv_lens = [0] * N
-    cfg_img_ropes = [0] * N
-    generation_input_cfg_img = model.prepare_vae_latent_cfg(
-        curr_kvlens=cfg_img_kv_lens, curr_rope=cfg_img_ropes,
-        image_sizes=[(resolution, resolution)] * N,
-    )
-    for k, v in generation_input_cfg_img.items():
-        if isinstance(v, torch.Tensor):
-            generation_input_cfg_img[k] = v.to(device)
+        # ── Step 4: Prepare img-CFG KV cache ──
+        cfg_img_past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+        cfg_img_kv_lens = [0] * N
+        cfg_img_ropes = [0] * N
+        generation_input_cfg_img = model.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_img_kv_lens, curr_rope=cfg_img_ropes,
+            image_sizes=[(resolution, resolution)] * N,
+        )
+        _to_device(generation_input_cfg_img)
 
-    # ── Step 5: Generate images (packed batch, all N at once) ──
-    with torch.no_grad():
-        with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
-            unpacked_latents, all_latents, all_log_probs, timesteps = model.generate_image(
+        # ── Step 5: Generate images (packed batch, all N at once) ──
+        unpacked_latents, all_latents, all_log_probs, timesteps = model.generate_image(
                 past_key_values=past_key_values,
                 cfg_text_past_key_values=cfg_text_past_key_values,
                 cfg_img_past_key_values=cfg_img_past_key_values,
