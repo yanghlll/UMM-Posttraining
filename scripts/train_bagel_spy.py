@@ -531,13 +531,21 @@ def main(_):
                 grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
                                                cell_size=config.resolution)
 
-                for pid in my_player_ids:
-                    vote_prompt = game_generator.format_voting_prompt(game_data, player_id=pid + 1)
-                    vote_text = run_bagel_vote(
-                        inferencer, grid_pil, vote_prompt,
+                # Use cached voting: encode grid ViT once, run all my votes
+                my_vote_prompts = [
+                    game_generator.format_voting_prompt(game_data, player_id=pid + 1)
+                    for pid in my_player_ids
+                ]
+                if my_vote_prompts:
+                    vote_texts = run_bagel_votes_cached(
+                        inferencer, grid_pil, my_vote_prompts,
                         max_tokens=max_vote_tokens,
                     )
-                    vote_info = game_generator.extract_vote(vote_text)
+                else:
+                    vote_texts = []
+
+                for i, pid in enumerate(my_player_ids):
+                    vote_info = game_generator.extract_vote(vote_texts[i])
                     if vote_info is None:
                         all_vote_tensors[g, pid] = -1
                     elif vote_info.get('voted_spy') == 'N/A':
