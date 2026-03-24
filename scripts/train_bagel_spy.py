@@ -816,70 +816,106 @@ def main(_):
         rank = accelerator.process_index
         n_gpus = accelerator.num_processes
 
+        # ── Training with deferred gradient sync ──
+        # Problem: DDP syncs gradients on every backward, causing ~12s idle wait
+        # between ranks that finish at different times.
+        # Solution: Disable DDP auto-sync during training. Each rank accumulates
+        # gradients independently. ONE manual all-reduce at the end of each inner epoch.
+        #
+        # How it works with generate_image_learn() internals:
+        #   - generate_image_learn calls accelerator.backward(loss) per SDE step
+        #   - It also calls optimizer.step() + zero_grad() per SDE step
+        #   - Under no_sync(): backward() accumulates without all-reduce
+        #   - optimizer.step()/zero_grad() are controlled by accelerator's
+        #     gradient_accumulation_steps (set to large value so they're no-ops)
+        #   - After all backward calls, we manually all-reduce + step
+
+        # Temporarily set huge grad_accum so accelerator never auto-steps
+        saved_grad_accum = accelerator.gradient_accumulation_steps
+        accelerator.gradient_accumulation_steps = 999999
+
+        no_sync_ctx = transformer.no_sync if hasattr(transformer, 'no_sync') else contextlib.nullcontext
+        info = defaultdict(list)
+
         for inner_epoch in range(num_inner_epochs):
             adv_idx = 0
-            for g in range(G):
-                prompts = all_game_prompts[g]
 
-                for pid in range(num_players):
-                    # Each rank only trains players it generated (has full trajectory)
-                    has_traj = (pid % n_gpus == rank) and ('all_latents' in all_game_trajs[g][pid])
+            with no_sync_ctx():
+                for g in range(G):
+                    prompts = all_game_prompts[g]
 
-                    if has_traj:
-                        ptraj = all_game_trajs[g][pid]
-                        latents = torch.stack(ptraj['all_latents'])
-                        log_probs = torch.stack(ptraj['all_log_probs'])
-                        timesteps = ptraj['timesteps']
+                    for pid in range(num_players):
+                        has_traj = (pid % n_gpus == rank) and ('all_latents' in all_game_trajs[g][pid])
 
-                        cur_sample = {
-                            'timesteps': timesteps,
-                            'latents': latents[:-1],
-                            'prev_latents': latents[1:],
-                            'log_probs': log_probs,
-                            'advantages': advantages[adv_idx].unsqueeze(0).expand(
-                                timesteps.shape[0], -1) if advantages.dim() > 0
-                                else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
-                                timesteps.shape[0], 1),
-                        }
-                        cur_sample['dtimesteps'] = torch.cat([
-                            timesteps[:-1] - timesteps[1:],
-                            timesteps[-1:],
-                        ])
+                        if has_traj:
+                            ptraj = all_game_trajs[g][pid]
+                            latents = torch.stack(ptraj['all_latents'])
+                            log_probs = torch.stack(ptraj['all_log_probs'])
+                            timesteps = ptraj['timesteps']
 
-                        with autocast():
-                            output_dict = inferencer(
-                                text=prompts[pid],
-                                noise_level=config.sample.noise_level,
-                                learn=True,
-                                sample=cur_sample,
-                                grpo_config=config,
-                                accelerator=accelerator,
-                                optimizer=optimizer,
-                                transformer=transformer,
-                                num_timesteps=config.sample.num_steps,
-                                cfg_text_scale=config.sample.guidance_scale,
-                                **inference_hyper,
-                            )
+                            cur_sample = {
+                                'timesteps': timesteps,
+                                'latents': latents[:-1],
+                                'prev_latents': latents[1:],
+                                'log_probs': log_probs,
+                                'advantages': advantages[adv_idx].unsqueeze(0).expand(
+                                    timesteps.shape[0], -1) if advantages.dim() > 0
+                                    else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
+                                    timesteps.shape[0], 1),
+                            }
+                            cur_sample['dtimesteps'] = torch.cat([
+                                timesteps[:-1] - timesteps[1:],
+                                timesteps[-1:],
+                            ])
 
-                        info["clipfrac"].append(output_dict["clipfrac"])
-                        info["clipfrac_gt_one"].append(output_dict.get("clipfrac_gt_one", output_dict["clipfrac"]))
-                        info["clipfrac_lt_one"].append(output_dict.get("clipfrac_lt_one", output_dict["clipfrac"]))
-                        info["policy_loss"].append(output_dict["policy_loss"])
-                        info["kl_loss"].append(output_dict["kl_loss"])
-                        info["loss"].append(output_dict["loss"])
+                            with autocast():
+                                output_dict = inferencer(
+                                    text=prompts[pid],
+                                    noise_level=config.sample.noise_level,
+                                    learn=True,
+                                    sample=cur_sample,
+                                    grpo_config=config,
+                                    accelerator=accelerator,
+                                    optimizer=optimizer,
+                                    transformer=transformer,
+                                    num_timesteps=config.sample.num_steps,
+                                    cfg_text_scale=config.sample.guidance_scale,
+                                    **inference_hyper,
+                                )
 
-                    adv_idx += 1
+                            info["clipfrac"].append(output_dict["clipfrac"])
+                            info["clipfrac_gt_one"].append(output_dict.get("clipfrac_gt_one", output_dict["clipfrac"]))
+                            info["clipfrac_lt_one"].append(output_dict.get("clipfrac_lt_one", output_dict["clipfrac"]))
+                            info["policy_loss"].append(output_dict["policy_loss"])
+                            info["kl_loss"].append(output_dict["kl_loss"])
+                            info["loss"].append(output_dict["loss"])
 
-                    if accelerator.sync_gradients:
-                        # Log training metrics locally (no cross-rank reduce to avoid sync)
-                        if info["loss"] and accelerator.is_main_process:
-                            log_info = {k: torch.mean(torch.stack(v)).item()
-                                        for k, v in info.items()}
-                            log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
-                            log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                            wandb.log(log_info, step=global_step)
-                        global_step += 1
-                        info = defaultdict(list)
+                        adv_idx += 1
+
+            # ── ONE gradient sync + optimizer step per inner epoch ──
+            if n_gpus > 1:
+                for param in transformer.parameters():
+                    if param.grad is not None:
+                        torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
+
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in transformer.parameters() if p.grad is not None],
+                config.train.max_grad_norm or 1.0,
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if info["loss"] and accelerator.is_main_process:
+                log_info = {k: torch.mean(torch.stack(v)).item()
+                            for k, v in info.items()}
+                log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
+                log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                wandb.log(log_info, step=global_step)
+            global_step += 1
+            info = defaultdict(list)
+
+        # Restore original grad_accum
+        accelerator.gradient_accumulation_steps = saved_grad_accum
 
     if accelerator.is_main_process:
         wandb.finish()
