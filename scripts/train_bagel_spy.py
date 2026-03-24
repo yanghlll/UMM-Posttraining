@@ -239,18 +239,29 @@ def main(_):
     G = spy_cfg.group_size
     num_inner_epochs = config.train.num_inner_epochs
 
-    # grad_accum = total backward calls per real optimizer step
-    # = G games × N players × sde_window_size (per-SDE-step backward inside generate_image_learn)
-    grad_accum = config.train.gradient_accumulation_steps * num_players * config.sample.sde_window_size
+    # grad_accum = backward calls per real optimizer step PER RANK
+    # With cross-GPU parallelism, each rank trains ceil(N/n_gpus) players per game.
+    # Total per rank = G * ceil(N/n_gpus) * sde_window_size
+    # We set this after accelerator init since we need n_gpus.
+    # For now use a placeholder; will be adjusted after accelerator init.
+    grad_accum_placeholder = config.train.gradient_accumulation_steps * num_players * config.sample.sde_window_size
 
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
-        gradient_accumulation_steps=grad_accum,
+        gradient_accumulation_steps=grad_accum_placeholder,
     )
     if hasattr(accelerator.state, 'fsdp_plugin') and accelerator.state.fsdp_plugin is not None:
         accelerator.state.fsdp_plugin.activation_checkpointing = config.activation_checkpointing
         accelerator.state.fsdp_plugin.transformer_cls_names_to_wrap = ['Qwen2MoTDecoderLayer']
+
+    # Recompute grad_accum with actual n_gpus for parallel training
+    n_gpus = accelerator.num_processes
+    import math as _math
+    players_per_rank = _math.ceil(num_players / n_gpus)
+    grad_accum = config.train.gradient_accumulation_steps * players_per_rank * config.sample.sde_window_size
+    # Override accelerator's setting
+    accelerator.gradient_accumulation_steps = grad_accum
 
     if accelerator.is_main_process:
         wandb.init(project="flow_grpo_spy", name=config.run_name, config=config.to_dict())
@@ -439,6 +450,10 @@ def main(_):
         epoch_civ_rewards = []
         t_gen_total, t_vote_total = 0.0, 0.0
 
+        # Use unwrapped model for all inference (DDP wrapping breaks .model access)
+        wrapped_lm_save = model.language_model
+        model.language_model = accelerator.unwrap_model(transformer)
+
         for g in tqdm(range(G), desc=f"Epoch {epoch}: games",
                       disable=not accelerator.is_local_main_process):
 
@@ -448,16 +463,20 @@ def main(_):
                 for pid in range(1, num_players + 1)
             ]
 
-            # ── Phase 1: Each player generates an image ──────────
-            # Use unwrapped model for sampling (DDP wrapping breaks .model access)
-            wrapped_lm_gen = model.language_model
-            model.language_model = accelerator.unwrap_model(transformer)
+            # ── Phase 1: Each GPU generates 1 player's image (parallel) ──
+            # With N=4 players and 4 GPUs, each GPU handles 1 player.
+            # With more/fewer GPUs, players are round-robin assigned.
             t_gen_start = time.time()
-            player_trajs = []
-            player_images_tensor = []
+            rank = accelerator.process_index
+            n_gpus = accelerator.num_processes
+
+            # Each GPU generates its assigned players
+            my_pids = [pid for pid in range(num_players) if pid % n_gpus == rank]
+            my_trajs = {}
+            my_images = {}
 
             with autocast():
-                for pid in range(num_players):
+                for pid in my_pids:
                     with torch.no_grad():
                         output_dict = inferencer(
                             text=prompts[pid],
@@ -468,44 +487,93 @@ def main(_):
                             cfg_text_scale=config.sample.guidance_scale,
                             **inference_hyper,
                         )
-                    player_trajs.append({
-                        'image': output_dict['image'],          # [3,H,W]
+                    my_trajs[pid] = {
+                        'image': output_dict['image'],
                         'all_latents': output_dict['all_latents'],
                         'all_log_probs': output_dict['all_log_probs'],
                         'timesteps': output_dict['timesteps'],
-                    })
-                    player_images_tensor.append(output_dict['image'])
+                    }
+                    my_images[pid] = output_dict['image']
 
-            model.language_model = wrapped_lm_gen  # restore for training later
+            # All-gather images across GPUs so every rank has all N images
+            # Pack into a tensor: [num_players, 3, H, W]
+            img_shape = list(my_images[my_pids[0]].shape) if my_pids else [3, config.resolution, config.resolution]
+            all_images_local = torch.zeros(num_players, *img_shape, device=accelerator.device, dtype=torch.bfloat16)
+            for pid in my_pids:
+                all_images_local[pid] = my_images[pid]
+            # Sum across ranks (each rank contributed its assigned slots, others are zero)
+            torch.distributed.all_reduce(all_images_local, op=torch.distributed.ReduceOp.SUM)
+
+            player_images_tensor = [all_images_local[pid] for pid in range(num_players)]
+
+            # Also gather trajectories: each rank needs all trajectories for training
+            # For trajectories, we gather via broadcast from the generating rank
+            player_trajs = [None] * num_players
+            for pid in range(num_players):
+                src_rank = pid % n_gpus
+                if src_rank == rank:
+                    player_trajs[pid] = my_trajs[pid]
+                else:
+                    # Receive trajectory data from src_rank
+                    # We need latents, log_probs, timesteps
+                    # Use all_reduce: src has data, others have zeros
+                    pass  # trajectories only needed on each rank for its own training
+
+            # For training, each rank only needs its own players' trajectories
+            # Fill in other players' trajs with just the image (for metrics)
+            for pid in range(num_players):
+                if player_trajs[pid] is None:
+                    player_trajs[pid] = {'image': player_images_tensor[pid]}
+
             t_gen_total += time.time() - t_gen_start
 
-            # Build voting grid on GPU (no CPU transfer), convert to PIL once
+            # ── Phase 2: Voting (only rank 0, then broadcast results) ──
             t_vote_start = time.time()
             grid_tensor = build_voting_grid_tensor(player_images_tensor,
                                                     cell_size=config.resolution)
             grid_pil = grid_tensor_to_pil(grid_tensor, num_players=num_players,
                                            cell_size=config.resolution)
 
-            # ── Phase 2: Voting (Bagel understanding mode) ───────
-            # Temporarily use unwrapped model for voting (DDP/FSDP wrapping
-            # breaks generate_text() which accesses .model.embed_tokens directly)
-            wrapped_lm = model.language_model
-            model.language_model = accelerator.unwrap_model(transformer)
-
-            # Build all vote prompts, then run with cached ViT encoding
-            # (encodes grid image once, reuses for all N voters)
             vote_prompts = [
                 game_generator.format_voting_prompt(game_data, player_id=pid)
                 for pid in range(1, num_players + 1)
             ]
+            # Every rank votes (same images, same prompts, but independent results)
+            # Each rank handles a subset of votes
+            my_vote_pids = [pid for pid in range(num_players) if pid % n_gpus == rank]
+            vote_texts_local = [''] * num_players
             with torch.no_grad():
-                vote_texts = run_bagel_votes_cached(
-                    inferencer, grid_pil, vote_prompts,
-                    max_tokens=max_vote_tokens,
-                )
-            game_votes = [game_generator.extract_vote(vt) for vt in vote_texts]
+                for pid in my_vote_pids:
+                    vote_texts_local[pid] = run_bagel_vote(
+                        inferencer, grid_pil, vote_prompts[pid],
+                        max_tokens=max_vote_tokens,
+                    )
 
-            model.language_model = wrapped_lm  # restore wrapped model
+            # Gather vote results: use a simple approach - broadcast vote info
+            # Pack votes as tensor of voted_spy values (-1 = invalid, 0 = N/A)
+            vote_tensor = torch.full((num_players,), -2, device=accelerator.device, dtype=torch.long)
+            for pid in my_vote_pids:
+                vote_info = game_generator.extract_vote(vote_texts_local[pid])
+                if vote_info is None:
+                    vote_tensor[pid] = -1
+                elif vote_info.get('voted_spy') == 'N/A':
+                    vote_tensor[pid] = 0
+                else:
+                    vote_tensor[pid] = vote_info.get('voted_spy', -1)
+            # All-reduce with MAX (each rank fills its slots, -2 means unfilled)
+            torch.distributed.all_reduce(vote_tensor, op=torch.distributed.ReduceOp.MAX)
+
+            game_votes = []
+            for pid in range(num_players):
+                v = vote_tensor[pid].item()
+                if v == -1:
+                    game_votes.append(None)
+                elif v == 0:
+                    game_votes.append({'voted_spy': 'N/A'})
+                elif v > 0:
+                    game_votes.append({'voted_spy': v})
+                else:
+                    game_votes.append(None)
 
             t_vote_total += time.time() - t_vote_start
 
@@ -685,62 +753,71 @@ def main(_):
                 for pid in range(1, num_players + 1)
             ])
 
+        # Restore wrapped model for training backward
+        model.language_model = wrapped_lm_save
+
+        rank = accelerator.process_index
+        n_gpus = accelerator.num_processes
+
         for inner_epoch in range(num_inner_epochs):
             adv_idx = 0
             for g in range(G):
                 prompts = all_game_prompts[g]
 
                 for pid in range(num_players):
-                    ptraj = all_game_trajs[g][pid]
+                    # Each rank only trains players it generated (has full trajectory)
+                    has_traj = (pid % n_gpus == rank) and ('all_latents' in all_game_trajs[g][pid])
 
-                    # Build per-step sample dict
-                    latents = torch.stack(ptraj['all_latents'])   # [num_steps+1, ...]
-                    log_probs = torch.stack(ptraj['all_log_probs'])  # [num_steps]
-                    timesteps = ptraj['timesteps']  # [num_steps]
+                    if has_traj:
+                        ptraj = all_game_trajs[g][pid]
+                        latents = torch.stack(ptraj['all_latents'])
+                        log_probs = torch.stack(ptraj['all_log_probs'])
+                        timesteps = ptraj['timesteps']
 
-                    cur_sample = {
-                        'timesteps': timesteps,
-                        'latents': latents[:-1],
-                        'prev_latents': latents[1:],
-                        'log_probs': log_probs,
-                        'advantages': advantages[adv_idx].unsqueeze(0).expand(
-                            timesteps.shape[0], -1) if advantages.dim() > 0
-                            else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
-                            timesteps.shape[0], 1),
-                    }
-                    # dtimesteps
-                    cur_sample['dtimesteps'] = torch.cat([
-                        timesteps[:-1] - timesteps[1:],
-                        timesteps[-1:],
-                    ])
+                        cur_sample = {
+                            'timesteps': timesteps,
+                            'latents': latents[:-1],
+                            'prev_latents': latents[1:],
+                            'log_probs': log_probs,
+                            'advantages': advantages[adv_idx].unsqueeze(0).expand(
+                                timesteps.shape[0], -1) if advantages.dim() > 0
+                                else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
+                                timesteps.shape[0], 1),
+                        }
+                        cur_sample['dtimesteps'] = torch.cat([
+                            timesteps[:-1] - timesteps[1:],
+                            timesteps[-1:],
+                        ])
 
-                    with autocast():
-                        output_dict = inferencer(
-                            text=prompts[pid],
-                            noise_level=config.sample.noise_level,
-                            learn=True,
-                            sample=cur_sample,
-                            grpo_config=config,
-                            accelerator=accelerator,
-                            optimizer=optimizer,
-                            transformer=transformer,
-                            num_timesteps=config.sample.num_steps,
-                            cfg_text_scale=config.sample.guidance_scale,
-                            **inference_hyper,
-                        )
+                        with autocast():
+                            output_dict = inferencer(
+                                text=prompts[pid],
+                                noise_level=config.sample.noise_level,
+                                learn=True,
+                                sample=cur_sample,
+                                grpo_config=config,
+                                accelerator=accelerator,
+                                optimizer=optimizer,
+                                transformer=transformer,
+                                num_timesteps=config.sample.num_steps,
+                                cfg_text_scale=config.sample.guidance_scale,
+                                **inference_hyper,
+                            )
 
-                    info["clipfrac"].append(output_dict["clipfrac"])
-                    info["clipfrac_gt_one"].append(output_dict.get("clipfrac_gt_one", output_dict["clipfrac"]))
-                    info["clipfrac_lt_one"].append(output_dict.get("clipfrac_lt_one", output_dict["clipfrac"]))
-                    info["policy_loss"].append(output_dict["policy_loss"])
-                    info["kl_loss"].append(output_dict["kl_loss"])
-                    info["loss"].append(output_dict["loss"])
+                        info["clipfrac"].append(output_dict["clipfrac"])
+                        info["clipfrac_gt_one"].append(output_dict.get("clipfrac_gt_one", output_dict["clipfrac"]))
+                        info["clipfrac_lt_one"].append(output_dict.get("clipfrac_lt_one", output_dict["clipfrac"]))
+                        info["policy_loss"].append(output_dict["policy_loss"])
+                        info["kl_loss"].append(output_dict["kl_loss"])
+                        info["loss"].append(output_dict["loss"])
+
                     adv_idx += 1
 
                     if accelerator.sync_gradients:
-                        log_info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                        log_info = accelerator.reduce(log_info, reduction="mean")
-                        log_info["abs_policy_loss"] = abs(log_info["policy_loss"].item())
+                        log_info = {k: torch.mean(torch.stack(v)) for k, v in info.items()} if info["loss"] else {}
+                        if log_info:
+                            log_info = accelerator.reduce(log_info, reduction="mean")
+                            log_info["abs_policy_loss"] = abs(log_info["policy_loss"].item())
                         log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
                         if accelerator.is_main_process:
                             wandb.log(log_info, step=global_step)

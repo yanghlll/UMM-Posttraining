@@ -1055,7 +1055,7 @@ def spy_game_bagel():
     config.spy_game = ml_collections.ConfigDict()
     config.spy_game.num_players = 4
     config.spy_game.group_size = 4         # G games per training step
-    config.spy_game.max_vote_tokens = 512
+    config.spy_game.max_vote_tokens = 128  # 128 is enough for <think>...</think><answer>N</answer>
     config.spy_game.num_objects_min = 3
     config.spy_game.num_objects_max = 6
     config.spy_game.num_to_modify = 2
