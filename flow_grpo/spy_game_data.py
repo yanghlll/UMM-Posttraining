@@ -228,25 +228,47 @@ class SpyGameDataGenerator:
             f"A 3D rendered scene with geometric objects on a flat surface: {desc}"
         )
 
-    def format_voting_prompt(self, game_data, player_id=None):
+    def format_voting_prompt(self, game_data, player_id=None, god_sees_description=False):
         """Create voting prompt for identifying the spy (Vision-Zero style).
 
         The voter sees all generated images as a labeled grid.
+
+        Args:
+            god_sees_description: If True, the God judge prompt includes the
+                original scene description as reference (similar to Vision-Zero).
         """
         N = game_data["num_players"]
 
         if player_id is None:
             # God judge perspective
+            if god_sees_description:
+                orig_desc = game_data.get("original_description", "")
+                desc_block = (
+                    f'The original scene description (what non-spy players received) is:\n'
+                    f'"{orig_desc}"\n\n'
+                )
+                compare_instruction = (
+                    f'1. Compare each image against the original description above.\n'
+                    f'2. Look for the image that deviates from the description '
+                    f'(e.g. different objects, colors, attributes, or positions).\n'
+                )
+            else:
+                desc_block = ''
+                compare_instruction = (
+                    f'1. Compare all {N} images carefully.\n'
+                    f'2. Look for objects that appear different in one image compared to the others.\n'
+                )
+
             return (
                 f'You are analyzing a game of "Who\'s the Odd One Out?" where '
                 f'{N} players each generated an image from a scene description. '
                 f'One player (the spy) received a slightly different description, '
                 f'so their generated image should look subtly different.\n\n'
+                f'{desc_block}'
                 f'You can see all {N} players\' generated images above, '
                 f'labeled "Player 1\'s generated image" through "Player {N}\'s generated image".\n\n'
                 f'What you should do:\n'
-                f'1. Compare all {N} images carefully.\n'
-                f'2. Look for objects that appear different in one image compared to the others.\n'
+                f'{compare_instruction}'
                 f'3. Identify which player generated the odd image.\n\n'
                 f'Required output format:\n'
                 f'<think>\n'
@@ -259,66 +281,71 @@ class SpyGameDataGenerator:
             )
 
         spy_player = game_data["spy_player"]
-        my_desc = game_data["player_descriptions"][player_id - 1]
+        scene_desc = game_data["player_descriptions"][player_id - 1]
+        role = "SPY" if player_id == spy_player else "CIV"
 
-        if player_id == spy_player:
-            role_block = (
-                f'Your role: SPY (your description was different)\n'
-                f'• You are the spy with a slightly different scene description. '
-                f'Your generated image may look different from what others generated.'
-            )
-            action_block = (
-                f'What you should do:\n'
-                f'1. Compare all {N} generated images carefully.\n'
-                f'2. You are the spy: Vote for someone else to avoid suspicion. '
-                f'Choose another player to vote for, but DON\'T vote for yourself '
-                f'as that would reveal your identity.'
+        role_text = "NOT SPY" if role == "CIV" else "SPY"
+
+        if role == "CIV":
+            role_detail = "You are not the spy. Your image should be consistent with most other players' images."
+            vote_instruction = (
+                "Look for the image that seems inconsistent with the others "
+                "(different objects, text, colors, positions, or style). Vote for the player you believe is the spy. "
+                "There is a reward for voting correctly."
             )
         else:
-            role_block = (
-                f'Your role: NOT SPY (your description was the same as most others)\n'
-                f'• You are not the spy. Your image should be consistent with '
-                f'most other players\' images.'
+            role_detail = (
+                "You are the spy. Your description was different from the majority. "
+                "Try to blend in and avoid being detected."
             )
-            action_block = (
-                f'What you should do:\n'
-                f'1. Compare all {N} generated images carefully.\n'
-                f'2. You are NOT the spy: Look for the image that seems inconsistent '
-                f'with the others or has different objects/colors/positions. '
-                f'Vote for the player you believe is the spy. '
-                f'There is a reward for voting correctly.'
+            vote_instruction = (
+                "Try to vote for a non-spy player to deflect suspicion. "
+                "Try to blend in and act like a civilian."
             )
 
+        other_players = [p for p in range(1, N + 1) if p != player_id]
+        other_players_str = ", ".join(str(p) for p in other_players)
+
         return (
-            f'You are PLAYER {player_id} of the game "Who\'s the Odd One Out?". '
-            f'Each player generated an image from a scene description. '
-            f'Now this is the decision-making stage. '
-            f'Your task is to vote on who is the Odd Player.\n\n'
-            f'{role_block}\n\n'
-            f'Your scene description (used to generate your image) was:\n'
-            f'"{my_desc}"\n\n'
-            f'Game Instructions:\n'
-            f'• There are {N} players in total. Only one player (the spy) had a different description.\n'
-            f'• The player voted as the odd player will be severely punished. '
-            f'Therefore all players will try to convince others that they are not the odd player.\n'
-            f'• The spy\'s image may have different objects or attributes compared to the majority.\n'
-            f'• You can see all {N} players\' generated images above, labeled "Player 1\'s generated image" through "Player {N}\'s generated image".\n\n'
-            f'{action_block}\n\n'
-            f'Required output format:\n'
+            f'You are PLAYER {player_id} in the game "Who\'s the Odd One Out?".\n\n'
+            f'## CRITICAL RULES — READ BEFORE ANYTHING ELSE\n'
+            f'- You MUST vote for exactly ONE player.\n'
+            f'- You CANNOT vote for yourself (Player {player_id}). You can only vote for: Player {other_players_str}.\n'
+            f'- You MUST use the exact output format specified below. Any deviation is invalid.\n\n'
+            f'## Your Role\n'
+            f'{role_text}: {role_detail}\n\n'
+            f'## Game Context\n'
+            f'- {N} players each generated an image from a scene description.\n'
+            f'- {N - 1} players (civilians) shared the same description. 1 player (the spy) had a different one.\n'
+            f'- The spy\'s image may contain different objects, colors, or attributes.\n'
+            f'- Your scene description was: "{scene_desc}"\n\n'
+            f'## Your Task\n'
+            f'1. Compare all {N} generated images carefully (labeled Player 1 through Player {N}).\n'
+            f'2. {vote_instruction}\n\n'
+            f'## Output Format (MANDATORY — follow exactly)\n'
+            f'You must respond with EXACTLY this structure and nothing else:\n\n'
             f'<think>\n'
-            f'your private step-by-step reasoning — may include suspicions, probabilities, deception, etc.\n'
+            f'Analyze and compare the images of other players. Identify which image is the most mismatched with the others, and explain your reasons.\n'
             f'</think>\n'
             f'<answer>\n'
-            f'PLAYER_NUMBER or N/A\n'
-            f'Example answer: 1; 2; 3; N/A. (Just number or N/A, don\'t contain any other text)\n'
-            f'If you are uncertain about who is the spy, you can answer N/A. '
-            f'This will result in a smaller penalty than guessing incorrectly.\n'
-            f'</answer>'
+            f'[A SINGLE number from: {other_players_str}]\n'
+            f'</answer>\n\n'
+            f'## Output Rules\n'
+            f'- The <answer> tag must contain ONLY a single number: one of {other_players_str}.\n'
+            f'- Do NOT include "Player", "PLAYER", or any other text inside <answer>. Just the number.\n'
+            f'- Do NOT list multiple numbers. Pick exactly one.\n'
+            f'- Do NOT vote for {player_id} (that is you).\n'
+            f'- Do NOT output anything outside the <think> and <answer> tags.'
         )
 
     def extract_vote(self, response):
         """Extract vote from response text. Returns dict or None."""
-        # Try <answer> tags
+        if not response or not isinstance(response, str):
+            return None
+
+        content = None
+
+        # Try <answer> tags first
         m = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
         if m:
             content = m.group(1).strip()
@@ -327,12 +354,26 @@ class SpyGameDataGenerator:
             m = re.search(r'\\\\?boxed\{(.*?)\}', response, re.DOTALL)
             if m:
                 content = m.group(1).strip()
-            else:
-                return None
 
-        if content.upper() in ("N/A", "NA"):
-            return {"voted_spy": "N/A"}
-        nums = re.findall(r'\b([1-9])\b', content)
+        if content is not None:
+            if content.upper() in ("N/A", "NA"):
+                return {"voted_spy": "N/A"}
+            nums = re.findall(r'\b([1-9])\b', content)
+            if nums:
+                return {"voted_spy": int(nums[0])}
+
+        # Fallback: look for bare number in the entire response
+        # (model sometimes outputs just "3" or "Player 2" without tags)
+        response_clean = response.strip()
+        # Check if response is just a bare number
+        if re.match(r'^[1-9]$', response_clean):
+            return {"voted_spy": int(response_clean)}
+        # Check for "Player N" pattern
+        m = re.search(r'(?:Player\s*|player\s*)([1-9])', response_clean)
+        if m:
+            return {"voted_spy": int(m.group(1))}
+        # Last resort: first single digit in response
+        nums = re.findall(r'\b([1-9])\b', response_clean[:200])
         if nums:
             return {"voted_spy": int(nums[0])}
         return None
@@ -385,18 +426,53 @@ class SpyGameDataGenerator:
             "spy_player": spy,
         }
 
-    def compute_generation_rewards(self, game_outcome):
-        """Convert game outcome to per-player generation rewards for Flow-GRPO."""
+    def compute_generation_rewards(self, game_outcome, beta=0.1, lambda_param=0.1):
+        """Compute zero-sum generation rewards (Vision-Zero strategic clue formula).
+
+        Based on God decision votes, reward spy for stealth and civilians for
+        catching the spy. Guarantees zero-sum across all players.
+
+        Formula:
+            Ψ = v_spy - mean(v_civilian)  (suspicion potential)
+            r_spy = -β × Ψ
+            r_civ_j = +β × Ψ / (N-1) - λ × (v_civ_j - mean(v_civ))
+
+        Args:
+            game_outcome: Dict from calculate_game_rewards() with vote_counts.
+            beta: Camp shared potential coefficient (default 0.1).
+            lambda_param: Individual suspicion penalty coefficient (default 0.1).
+
+        Returns:
+            List of N rewards (0-indexed), guaranteed zero-sum.
+        """
         N = len(game_outcome["player_rewards"])
         spy = game_outcome["spy_player"]
-        caught = game_outcome["spy_caught"]
+        vote_counts = game_outcome["vote_counts"]
 
-        gen_rewards = []
-        for pid in range(1, N + 1):
-            if pid == spy:
-                gen_rewards.append(1.0 if not caught else -1.0)
-            else:
-                gen_rewards.append(1.0 if caught else -0.5)
+        # Votes received by spy
+        v_spy = vote_counts.get(spy, 0)
+
+        # Votes received by each civilian and their average
+        civilian_pids = [pid for pid in range(1, N + 1) if pid != spy]
+        v_civ = [vote_counts.get(pid, 0) for pid in civilian_pids]
+        v_civ_bar = sum(v_civ) / len(v_civ) if v_civ else 0.0
+
+        # Suspicion potential
+        psi = v_spy - v_civ_bar
+
+        # Compute rewards
+        gen_rewards = [0.0] * N
+        num_civilians = N - 1
+
+        # Spy reward
+        gen_rewards[spy - 1] = -beta * psi
+
+        # Civilian rewards
+        for i, pid in enumerate(civilian_pids):
+            shared_reward = beta * psi / num_civilians
+            individual_suspicion = -lambda_param * (v_civ[i] - v_civ_bar)
+            gen_rewards[pid - 1] = shared_reward + individual_suspicion
+
         return gen_rewards
 
     def update_baselines(self, spy_reward, civ_avg_reward):
@@ -442,16 +518,34 @@ _COLOR_MAP = {
     'red': 'blue', 'blue': 'red', 'green': 'yellow', 'yellow': 'green',
     'white': 'black', 'black': 'white', 'pink': 'orange', 'orange': 'pink',
     'purple': 'brown', 'brown': 'purple', 'gray': 'golden', 'golden': 'gray',
+    'silver': 'bronze', 'bronze': 'silver', 'dark': 'bright', 'bright': 'dark',
+    'crimson': 'teal', 'teal': 'crimson', 'blonde': 'brunette', 'brunette': 'blonde',
 }
 
 _SIZE_MAP = {
     'large': 'small', 'small': 'large', 'big': 'tiny', 'tiny': 'big',
-    'tall': 'short', 'short': 'tall',
+    'tall': 'short', 'short': 'tall', 'huge': 'miniature', 'miniature': 'huge',
+    'giant': 'little', 'little': 'giant', 'wide': 'narrow', 'narrow': 'wide',
+    'thick': 'thin', 'thin': 'thick', 'long': 'short', 'massive': 'tiny',
 }
 
 _COUNT_MAP = {
     'one': 'two', 'two': 'three', 'three': 'four', 'four': 'five',
-    'five': 'six', 'six': 'seven',
+    'five': 'six', 'six': 'seven', 'single': 'double', 'double': 'triple',
+}
+
+_MATERIAL_MAP = {
+    'wooden': 'stone', 'stone': 'wooden', 'metal': 'glass', 'glass': 'metal',
+    'gold': 'silver', 'silver': 'gold', 'steel': 'wooden', 'marble': 'brick',
+    'leather': 'silk', 'silk': 'leather', 'cotton': 'velvet', 'velvet': 'cotton',
+}
+
+_STYLE_MAP = {
+    'modern': 'ancient', 'ancient': 'modern', 'old': 'new', 'new': 'old',
+    'realistic': 'abstract', 'abstract': 'realistic',
+    'happy': 'sad', 'sad': 'happy', 'young': 'old', 'beautiful': 'rugged',
+    'calm': 'stormy', 'stormy': 'calm', 'sunny': 'rainy', 'rainy': 'sunny',
+    'winter': 'summer', 'summer': 'winter', 'morning': 'evening', 'evening': 'morning',
 }
 
 _WORD_SWAPS = {
@@ -502,35 +596,44 @@ def modify_ocr_prompt(prompt, rng):
 
 
 def modify_natural_prompt(prompt, rng):
-    """Modify a natural-language prompt: swap color, size, count, or add detail."""
-    # Try color swap
-    colors_found = [c for c in _COLOR_MAP if re.search(r'\b' + c + r'\b', prompt, re.I)]
-    if colors_found:
-        old = rng.choice(colors_found)
-        new = _COLOR_MAP[old]
-        modified = re.sub(r'\b' + old + r'\b', new, prompt, count=1, flags=re.I)
-        return modified, f"color: {old}→{new}"
+    """Modify a natural-language prompt: swap color, size, count, material, or style.
 
-    # Try size swap
-    sizes_found = [s for s in _SIZE_MAP if re.search(r'\b' + s + r'\b', prompt, re.I)]
-    if sizes_found:
-        old = rng.choice(sizes_found)
-        new = _SIZE_MAP[old]
-        modified = re.sub(r'\b' + old + r'\b', new, prompt, count=1, flags=re.I)
-        return modified, f"size: {old}→{new}"
+    Returns (modified_prompt, change_description) or None if no modification possible.
+    """
+    # Collect all possible modifications, then pick one randomly
+    candidates = []
 
-    # Try count swap
+    # Color swaps
+    for c in _COLOR_MAP:
+        if re.search(r'\b' + c + r'\b', prompt, re.I):
+            candidates.append(('color', c, _COLOR_MAP[c]))
+
+    # Size swaps
+    for s in _SIZE_MAP:
+        if re.search(r'\b' + s + r'\b', prompt, re.I):
+            candidates.append(('size', s, _SIZE_MAP[s]))
+
+    # Count swaps
     for old, new in _COUNT_MAP.items():
         if re.search(r'\b' + old + r'\b', prompt, re.I):
-            modified = re.sub(r'\b' + old + r'\b', new, prompt, count=1, flags=re.I)
-            return modified, f"count: {old}→{new}"
+            candidates.append(('count', old, new))
 
-    # Fallback: append detail
-    extras = ["with a small red ball", "near a wooden fence", "under a cloudy sky",
-              "next to a blue car", "beside a green tree"]
-    extra = rng.choice(extras)
-    modified = prompt.rstrip('.') + f", {extra}."
-    return modified, f"added: {extra}"
+    # Material swaps
+    for m in _MATERIAL_MAP:
+        if re.search(r'\b' + m + r'\b', prompt, re.I):
+            candidates.append(('material', m, _MATERIAL_MAP[m]))
+
+    # Style/adjective swaps
+    for s in _STYLE_MAP:
+        if re.search(r'\b' + s + r'\b', prompt, re.I):
+            candidates.append(('style', s, _STYLE_MAP[s]))
+
+    if not candidates:
+        return None  # No attribute to modify — caller should pick another prompt
+
+    category, old, new = rng.choice(candidates)
+    modified = re.sub(r'\b' + re.escape(old) + r'\b', new, prompt, count=1, flags=re.I)
+    return modified, f"{category}: {old}→{new}"
 
 
 def modify_geneval_prompt(prompt, metadata, rng):
@@ -593,7 +696,6 @@ class TextFileGameDataGenerator(SpyGameDataGenerator):
                 self.prompts = [line.strip() for line in f if len(line.strip()) > 20]
         elif prompt_type == 'geneval':
             jsonl_path = os.path.join(dataset_path, f'{split}_metadata.jsonl')
-            import json
             with open(jsonl_path, 'r') as f:
                 for line in f:
                     data = json.loads(line)
@@ -610,18 +712,26 @@ class TextFileGameDataGenerator(SpyGameDataGenerator):
         """Generate a game from the loaded prompt file."""
         rng = random.Random(epoch * 10000 + sample_idx)
 
-        # Pick a prompt
-        idx = rng.randint(0, len(self.prompts) - 1)
-        orig = self.prompts[idx]
+        # Pick a prompt and create modified version (retry if no modification possible)
+        for attempt in range(50):
+            idx = rng.randint(0, len(self.prompts) - 1)
+            orig = self.prompts[idx]
 
-        # Create modified version
-        if self.prompt_type == 'ocr':
-            mod, change_desc = modify_ocr_prompt(orig, rng)
-        elif self.prompt_type == 'geneval':
-            meta = self.metadatas[idx] if idx < len(self.metadatas) else {}
-            mod, change_desc = modify_geneval_prompt(orig, meta, rng)
+            if self.prompt_type == 'ocr':
+                result = modify_ocr_prompt(orig, rng)
+            elif self.prompt_type == 'geneval':
+                meta = self.metadatas[idx] if idx < len(self.metadatas) else {}
+                result = modify_geneval_prompt(orig, meta, rng)
+            else:
+                result = modify_natural_prompt(orig, rng)
+
+            if result is not None:
+                mod, change_desc = result
+                break
         else:
-            mod, change_desc = modify_natural_prompt(orig, rng)
+            # After 50 attempts, use last prompt with a color swap fallback
+            mod = orig + " in blue tones"
+            change_desc = "fallback: appended color tone"
 
         # Assign spy
         spy_player = rng.randint(1, self.num_players)

@@ -129,7 +129,7 @@ model = load_checkpoint_and_dispatch(
     offload_buffers=True,
     dtype=torch.bfloat16,
     force_hooks=True,
-    offload_folder="/tmp/offload"
+    offload_folder="/adialab/usr/shadabk/MedUMM/.offload"
 )
 vae_model.to(device="cuda:0",dtype=torch.bfloat16)
 model = model.eval()

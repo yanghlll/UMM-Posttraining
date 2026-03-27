@@ -1298,6 +1298,95 @@ class Bagel(PreTrainedModel):
 
         return torch.stack(generated_sequence, dim=0)
 
+    @torch.no_grad
+    def generate_text_with_logprobs(
+        self,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        key_values_lens: torch.IntTensor,
+        packed_start_tokens: torch.LongTensor,
+        packed_query_position_ids: torch.LongTensor,
+        max_length: int,
+        temperature: float = 0.7,
+        end_token_id: int = None,
+    ):
+        """Generate text with per-token log probabilities for GRPO training.
+
+        Returns:
+            generated_ids: [max_steps, batch_size] token ids
+            all_log_probs: [max_steps, batch_size] per-token log probs under sampling policy
+        """
+        device = next(self.language_model.parameters()).device
+        packed_start_tokens = packed_start_tokens.to(device)
+        packed_query_position_ids = packed_query_position_ids.to(device)
+        key_values_lens = key_values_lens.to(device)
+        packed_key_value_indexes = packed_key_value_indexes.to(device)
+
+        extra_inputs = {"mode": "und"} if self.use_moe else {}
+        batch_size = len(key_values_lens)
+
+        step = 0
+        generated_sequence = []
+        token_log_probs = []
+        curr_tokens = packed_start_tokens
+        eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device) if batch_size > 1 else None
+
+        while step < max_length:
+            generated_sequence.append(curr_tokens)
+            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            query_lens = torch.ones_like(curr_tokens)
+            packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
+                0, batch_size, device=device, dtype=key_values_lens.dtype)
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = uppacked[i] + i
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+
+            output = self.language_model.forward(
+                packed_query_sequence=packed_text_embedding,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=True,
+                is_causal=True,
+                **extra_inputs,
+            )
+            past_key_values = output.past_key_values
+            pred_logits = self.language_model.lm_head(output.packed_query_sequence)
+
+            # Sample and compute log prob
+            log_probs_all = F.log_softmax(pred_logits / temperature, dim=-1)
+            probs = torch.exp(log_probs_all)
+            curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            # Gather log prob of sampled token
+            sampled_logp = torch.gather(log_probs_all, dim=-1,
+                                         index=curr_tokens.unsqueeze(-1)).squeeze(-1)
+            token_log_probs.append(sampled_logp)
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = torch.cat(
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=device)], dim=0)
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + 1
+            step += 1
+
+            if end_token_id is not None:
+                if batch_size == 1:
+                    if curr_tokens[0] == end_token_id:
+                        break
+                else:
+                    eos_mask |= (curr_tokens == end_token_id)
+                    if eos_mask.all():
+                        break
+
+        return torch.stack(generated_sequence, dim=0), torch.stack(token_log_probs, dim=0)
+
     # for evaluation
     @torch.no_grad()
     def chat(

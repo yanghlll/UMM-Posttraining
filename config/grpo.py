@@ -1030,43 +1030,47 @@ def spy_game_bagel():
     config.mixed_precision = "bf16"
 
     # Sampling (per-player image generation)
-    config.sample.num_steps = 15
+    config.sample.num_steps = 25
     config.sample.eval_num_steps = 50
     config.sample.guidance_scale = 4.0
     config.sample.eval_guidance_scale = 4.0
     config.sample.same_latent = False
-    config.sample.noise_level = 1.3
-    config.sample.sde_window_size = 3
+    config.sample.noise_level = 1.0
+    config.sample.sde_window_size = 5
     config.sample.sde_window_range = (0, config.sample.num_steps // 2)
 
     # Training
-    config.train.num_inner_epochs = 1
-    config.train.clip_range_lt = 1e-5
-    config.train.clip_range_gt = 1e-5
-    config.train.beta = 0
-    config.train.learning_rate = 1e-4
+    config.train.num_inner_epochs = 2
+    config.train.clip_range_lt = 1e-5       # flow_grpo bagel default (diffusion SDE ratio clipping)
+    config.train.clip_range_gt = 1e-5       # flow_grpo bagel default (diffusion SDE ratio clipping)
+    config.train.beta = 0                   # KL penalty disabled (needs ref model init; TODO)
+    config.train.learning_rate = 1e-4       # flow_grpo bagel default
     config.train.cfg = True
     config.train.ema = False
-    # gradient_accumulation_steps: multiplied by N_players * sde_window in script
-    # Effective: G * N * sde_window = 4 * 4 * 3 = 48 backward calls per real update
-    config.train.gradient_accumulation_steps = 4  # = G games accumulated
+    # gradient_accumulation_steps: manual sync in script
+    # Backward calls per inner epoch: G * N * sde_window = 8 * 4 * 5 = 160
+    config.train.gradient_accumulation_steps = 8  # = G games accumulated
 
     # Spy game config (no external VLM — Bagel self-votes)
     config.spy_game = ml_collections.ConfigDict()
     config.spy_game.num_players = 4
-    config.spy_game.group_size = 4         # G games per training step
-    config.spy_game.max_vote_tokens = 512
+    config.spy_game.group_size = 8         # G games per training step
+    config.spy_game.max_vote_tokens = 1024
     config.spy_game.num_objects_min = 3
     config.spy_game.num_objects_max = 6
     config.spy_game.num_to_modify = 2
-    config.spy_game.use_role_advantage = False  # Enable Vision-Zero style role advantage
+    config.spy_game.use_role_advantage = True   # Vision-Zero style role advantage (EMA baseline)
+    config.spy_game.reward_beta = 0.1      # Camp shared potential coefficient (Vision-Zero)
+    config.spy_game.reward_lambda = 0.1    # Individual suspicion penalty coefficient (Vision-Zero)
+    config.spy_game.god_vote_K = 8         # Number of God-judge votes per game (Vision-Zero style)
+    config.spy_game.god_sees_description = False  # If True, God judge sees original CIV description as reference
 
     config.activation_checkpointing = True
-    config.fsdp_optimizer_offload = True
 
+    config.logdir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs'
     config.save_freq = 30
     config.eval_freq = 30
-    config.save_dir = 'logs/spy_game/bagel'
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel'
     config.num_epochs = 100000
 
     return config
@@ -1085,9 +1089,9 @@ def spy_game_bagel_ocr():
     """Bagel training with spy-civ self-play on OCR text rendering data."""
     config = spy_game_bagel()
     config.run_name = "[bagel-spy-ocr]-4gpu"
-    config.dataset = os.path.join(os.getcwd(), "dataset/ocr")
+    config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/ocr"
     config.spy_game.prompt_type = "ocr"  # use TextFileGameDataGenerator
-    config.save_dir = 'logs/spy_game/bagel_ocr'
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_ocr'
     return config
 
 
@@ -1105,9 +1109,11 @@ def spy_game_bagel_pickscore():
     """Bagel training with spy-civ self-play on pickscore natural scene data."""
     config = spy_game_bagel()
     config.run_name = "[bagel-spy-pickscore]-4gpu"
-    config.dataset = os.path.join(os.getcwd(), "dataset/pickscore")
+    config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/pickscore"
     config.spy_game.prompt_type = "pickscore"
-    config.save_dir = 'logs/spy_game/bagel_pickscore'
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore'
+    config.resume_from = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore/checkpoint-360'
+    config.wandb_resume_id = 'ynvpi07w'
     return config
 
 

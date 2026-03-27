@@ -374,7 +374,7 @@ def main(_):
         offload_buffers=False,            # 关闭缓冲区卸载（确保完全加载）
         dtype=inference_dtype,
         force_hooks=True,
-        offload_folder="/tmp/offload"
+        offload_folder="/adialab/usr/shadabk/MedUMM/.offload"
     )
     model = model.eval()
 

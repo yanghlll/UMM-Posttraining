@@ -48,7 +48,7 @@ vit_transform = ImageTransform(490, 112, 7)
 model = load_checkpoint_and_dispatch(
     model, checkpoint=os.path.join(model_local_dir, 'ema.safetensors'),
     device_map={'': device}, offload_buffers=False, dtype=dtype,
-    force_hooks=True, offload_folder='/tmp/offload')
+    force_hooks=True, offload_folder='/adialab/usr/shadabk/MedUMM/.offload')
 for m in model.modules():
     remove_hook_from_module(m)
 model.eval(); vae_model.to(device, dtype=dtype)

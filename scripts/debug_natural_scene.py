@@ -228,7 +228,7 @@ print("Loading checkpoint...")
 model = load_checkpoint_and_dispatch(
     model, checkpoint=os.path.join(model_local_dir, "ema.safetensors"),
     device_map={"": device}, offload_buffers=False, dtype=dtype,
-    force_hooks=True, offload_folder="/tmp/offload"
+    force_hooks=True, offload_folder="/adialab/usr/shadabk/MedUMM/.offload"
 )
 model.eval()
 vae_model.to(device, dtype=dtype)
