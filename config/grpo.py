@@ -1030,13 +1030,13 @@ def spy_game_bagel():
     config.mixed_precision = "bf16"
 
     # Sampling (per-player image generation)
-    config.sample.num_steps = 25
+    config.sample.num_steps = 20
     config.sample.eval_num_steps = 50
     config.sample.guidance_scale = 4.0
     config.sample.eval_guidance_scale = 4.0
     config.sample.same_latent = False
     config.sample.noise_level = 1.0
-    config.sample.sde_window_size = 5
+    config.sample.sde_window_size = 4
     config.sample.sde_window_range = (0, config.sample.num_steps // 2)
 
     # Training
@@ -1108,12 +1108,11 @@ def spy_game_bagel_geneval():
 def spy_game_bagel_pickscore():
     """Bagel training with spy-civ self-play on pickscore natural scene data."""
     config = spy_game_bagel()
-    config.run_name = "[bagel-spy-pickscore]-4gpu"
-    config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/pickscore"
+    config.run_name = "[bagel-spy-pickscore-god-desc]-4gpu"
+    config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/pickscore_sfw"
     config.spy_game.prompt_type = "pickscore"
-    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore'
-    config.resume_from = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore/checkpoint-360'
-    config.wandb_resume_id = 'ynvpi07w'
+    config.spy_game.god_sees_description = True  # God judge sees original CIV description
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore_god_desc'
     return config
 
 

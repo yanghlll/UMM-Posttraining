@@ -28,7 +28,6 @@ from ml_collections import config_flags
 from accelerate import Accelerator, load_checkpoint_and_dispatch, init_empty_weights
 from accelerate.utils import set_seed, ProjectConfiguration
 from accelerate.logging import get_logger
-from diffusers.utils.torch_utils import is_compiled_module
 
 # bagel
 from flow_grpo.bagel.data.data_utils import add_special_tokens
@@ -52,8 +51,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from functools import partial
-import tqdm
+
 import tempfile
 from PIL import Image
 from peft import LoraConfig, get_peft_model
@@ -299,8 +297,6 @@ def compute_vote_statistics(all_game_votes: list, all_game_data: list) -> dict:
         "vote_na_rate": na_votes / max(total_votes, 1),
     }
 
-tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
-
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
 logger = get_logger(__name__)
@@ -340,7 +336,6 @@ def main(_):
 
     n_gpus = accelerator.num_processes
     import math as _math
-    players_per_rank = _math.ceil(num_players / n_gpus)
 
     if accelerator.is_main_process:
         wandb_resume_id = getattr(config, 'wandb_resume_id', None)
@@ -510,11 +505,12 @@ def main(_):
     logger.info("***** Running Bagel Spy-Civ Flow-GRPO Training *****")
     logger.info(f"  Players={num_players}, G={G}, inner_epochs={num_inner_epochs}")
     logger.info(f"  SDE window={config.sample.sde_window_size}")
-    logger.info(f"  GPUs={n_gpus}, players_per_rank={players_per_rank}")
+    games_per_rank = _math.ceil(G / n_gpus)
+    logger.info(f"  GPUs={n_gpus}, games_per_rank={games_per_rank} (sequential gen per game)")
     logger.info(f"  Gradient sync: manual no_sync + all_reduce AVG")
     logger.info(f"  Backward calls per rank per inner epoch: "
-                f"{G}(games) x {players_per_rank}(players/rank) x {config.sample.sde_window_size}(sde) "
-                f"= {G * players_per_rank * config.sample.sde_window_size}")
+                f"{games_per_rank}(games/rank) x {num_players}(players) x {config.sample.sde_window_size}(sde) "
+                f"= {games_per_rank * num_players * config.sample.sde_window_size}")
     logger.info(f"  Total trajectories per epoch: {G * num_players} "
                 f"({G} games x {num_players} players)")
 
@@ -584,12 +580,11 @@ def main(_):
 
         rank = accelerator.process_index
         n_gpus = accelerator.num_processes
-        my_player_ids = [pid for pid in range(num_players) if pid % n_gpus == rank]
 
         # ================================================================
-        # BATCHED PHASE 1: Generate ALL games × my players (no sync)
-        # Each GPU generates its assigned players for ALL G games at once.
-        # Only 1 all_reduce at the end instead of G all_reduces.
+        # PHASE 1: Sequential generation — each player sees previous images
+        # Parallelism: each GPU handles a subset of GAMES (not players).
+        # Within each game, players generate sequentially: 1 → 2 → 3 → 4.
         # ================================================================
         t_gen_start = time.time()
         all_my_trajs = []   # [G] dict mapping pid -> traj
@@ -599,19 +594,29 @@ def main(_):
         for g in range(G):
             all_game_data_list.append(game_generator.generate_game(epoch * G + g, global_step))
 
+        # Each GPU handles its subset of games
+        my_game_ids_gen = [g for g in range(G) if g % n_gpus == rank]
+
+        # Initialize per-game storage for all G games
+        for g in range(G):
+            all_my_trajs.append({})
+            all_my_images.append({})
+
         with autocast():
-            for g in range(G):
+            for g in my_game_ids_gen:
                 game_data = all_game_data_list[g]
-                prompts = [
-                    game_generator.format_generation_prompt(game_data, pid)
-                    for pid in range(1, num_players + 1)
-                ]
-                my_trajs_g = {}
-                my_images_g = {}
-                for pid in my_player_ids:
+                game_pil_images = []  # Accumulate PIL images for previous players
+
+                for pid in range(num_players):
+                    player_id = pid + 1  # 1-indexed
+
+                    # Build interleaved input: [prev_label, prev_img, ..., prompt]
+                    input_list = game_generator.build_generation_input_list(
+                        game_data, player_id, game_pil_images)
+
                     with torch.no_grad():
-                        output_dict = inferencer(
-                            text=prompts[pid],
+                        output_dict = inferencer.interleave_inference(
+                            input_list,
                             noise_level=config.sample.noise_level,
                             grpo_config=config,
                             accelerator=accelerator,
@@ -619,23 +624,34 @@ def main(_):
                             cfg_text_scale=config.sample.guidance_scale,
                             **inference_hyper,
                         )
-                    my_trajs_g[pid] = {
-                        'image': output_dict['image'],
-                        'all_latents': output_dict['all_latents'],
-                        'all_log_probs': output_dict['all_log_probs'],
-                        'timesteps': output_dict['timesteps'],
+                    # output_dict is a single item (the generated image dict)
+                    result = output_dict[0] if isinstance(output_dict, list) else output_dict
+
+                    all_my_trajs[g][pid] = {
+                        'image': result['image'],
+                        'all_latents': result['all_latents'],
+                        'all_log_probs': result['all_log_probs'],
+                        'timesteps': result['timesteps'],
                     }
-                    my_images_g[pid] = output_dict['image']
-                all_my_trajs.append(my_trajs_g)
-                all_my_images.append(my_images_g)
+                    all_my_images[g][pid] = result['image']
+
+                    # Convert to PIL and accumulate for next player's context
+                    pil_img = tensor_images_to_pil(result['image'].unsqueeze(0).float())[0]
+                    game_pil_images.append(pil_img)
 
         # SINGLE all_reduce for ALL G games' images at once: [G, N, 3, H, W]
-        first_img = list(all_my_images[0].values())[0]
-        img_shape = list(first_img.shape)
+        # Find image shape from any generated image
+        img_shape = None
+        for g in my_game_ids_gen:
+            img_shape = list(all_my_images[g][0].shape)
+            break
+        # Broadcast img_shape from rank that has it
+        if img_shape is None:
+            img_shape = [3, config.resolution, config.resolution]  # fallback
         all_images_packed = torch.zeros(G, num_players, *img_shape,
                                         device=accelerator.device, dtype=torch.bfloat16)
-        for g in range(G):
-            for pid in my_player_ids:
+        for g in my_game_ids_gen:
+            for pid in range(num_players):
                 all_images_packed[g, pid] = all_my_images[g][pid]
         torch.distributed.all_reduce(all_images_packed, op=torch.distributed.ReduceOp.SUM)
 
@@ -705,7 +721,7 @@ def main(_):
 
             # Build game_outcome compatible with compute_generation_rewards
             spy_pid = game_data['spy_player']
-            spy_caught = vote_counts[spy_pid] > god_vote_K // 2
+            spy_caught = vote_counts[spy_pid] == max(vote_counts.values())
             game_outcome = {
                 "player_rewards": {pid + 1: 0.0 for pid in range(num_players)},
                 "spy_caught": spy_caught,
@@ -737,10 +753,6 @@ def main(_):
                 if i != spy_pid - 1:
                     epoch_civ_rewards.append(r)
 
-            civ_rs = [gen_rewards[i] for i in range(num_players) if i != spy_pid - 1]
-            game_generator.update_baselines(gen_rewards[spy_pid - 1],
-                                            np.mean(civ_rs) if civ_rs else 0.0)
-
             # Build player_trajs for training
             player_trajs = [None] * num_players
             for pid in range(num_players):
@@ -756,6 +768,7 @@ def main(_):
             all_game_outcomes.append(game_outcome)
 
         # ── Group-relative advantages ────────────────────────────
+        # First apply role advantage using PREVIOUS epoch's baseline (before update)
         if use_role_advantage:
             adjusted_rewards = []
             for g in range(G):
@@ -767,6 +780,14 @@ def main(_):
         else:
             flat_rewards_raw = [r for rw in all_game_rewards for r in rw]
             flat_rewards = flat_rewards_raw
+
+        # NOW update baselines with current epoch's data (for next epoch)
+        for g in range(G):
+            spy_pid = all_game_data_list[g]['spy_player']
+            spy_r = all_game_rewards[g][spy_pid - 1]
+            civ_rs = [all_game_rewards[g][i] for i in range(num_players) if i != spy_pid - 1]
+            game_generator.update_baselines(spy_r, sum(civ_rs) / len(civ_rs) if civ_rs else 0.0)
+
         # Vision-Zero: role-adjusted rewards → group-level mean/std normalization
         advantages = compute_group_advantages(flat_rewards).to(accelerator.device)
 
@@ -806,14 +827,17 @@ def main(_):
                 if hasattr(layer, 'self_attn'):
                     layer.self_attn.training = False
 
-        # Pre-compute prompts for training
-        all_game_prompts = []
+        # Pre-compute PIL images of previous players for each game (for training context)
+        # all_images_packed is [G, N, 3, H, W] — convert to PIL per game per player
+        all_game_prev_pils = []  # [G][N] list of lists: prev_pils[g][pid] = list of PIL for players 0..pid-1
         for g in range(G):
-            gd = all_game_data_list[g]
-            all_game_prompts.append([
-                game_generator.format_generation_prompt(gd, pid)
-                for pid in range(1, num_players + 1)
-            ])
+            game_prev_pils = []
+            accumulated_pils = []
+            for pid in range(num_players):
+                game_prev_pils.append(list(accumulated_pils))  # copy current list
+                pil_img = tensor_images_to_pil(all_images_packed[g, pid].unsqueeze(0).float())[0]
+                accumulated_pils.append(pil_img)
+            all_game_prev_pils.append(game_prev_pils)
 
         # Restore wrapped model for training backward
         model.language_model = wrapped_lm_save
@@ -822,23 +846,22 @@ def main(_):
         n_gpus = accelerator.num_processes
 
         # ── [ACCEL PATCH 2] Training with deferred gradient sync ──
-        # Disable DDP auto-sync during training. Each rank accumulates
-        # gradients independently. ONE manual all-reduce at the end.
         saved_grad_accum = accelerator.gradient_accumulation_steps
         accelerator.gradient_accumulation_steps = 999999
 
         no_sync_ctx = transformer.no_sync if hasattr(transformer, 'no_sync') else contextlib.nullcontext
         info = defaultdict(list)
 
+        # Training: per-game parallelism (same as generation phase)
+        my_game_ids_train = set(g for g in range(G) if g % n_gpus == rank)
+
         for inner_epoch in range(num_inner_epochs):
             adv_idx = 0
 
             with no_sync_ctx():
                 for g in range(G):
-                    prompts = all_game_prompts[g]
-
                     for pid in range(num_players):
-                        has_traj = (pid % n_gpus == rank) and ('all_latents' in all_game_trajs[g][pid])
+                        has_traj = (g in my_game_ids_train) and ('all_latents' in all_game_trajs[g][pid])
 
                         if has_traj:
                             ptraj = all_game_trajs[g][pid]
@@ -861,9 +884,14 @@ def main(_):
                                 timesteps[-1:],
                             ])
 
+                            # Build interleaved input with previous players' images
+                            prev_pils = all_game_prev_pils[g][pid]
+                            input_list = game_generator.build_generation_input_list(
+                                all_game_data_list[g], pid + 1, prev_pils)
+
                             with autocast():
-                                output_dict = inferencer(
-                                    text=prompts[pid],
+                                output_dict = inferencer.interleave_inference(
+                                    input_list,
                                     noise_level=config.sample.noise_level,
                                     learn=True,
                                     sample=cur_sample,
@@ -875,13 +903,15 @@ def main(_):
                                     cfg_text_scale=config.sample.guidance_scale,
                                     **inference_hyper,
                                 )
+                            # interleave_inference returns a list
+                            result = output_dict[0] if isinstance(output_dict, list) else output_dict
 
-                            info["clipfrac"].append(output_dict["clipfrac"])
-                            info["clipfrac_gt_one"].append(output_dict.get("clipfrac_gt_one", output_dict["clipfrac"]))
-                            info["clipfrac_lt_one"].append(output_dict.get("clipfrac_lt_one", output_dict["clipfrac"]))
-                            info["policy_loss"].append(output_dict["policy_loss"])
-                            info["kl_loss"].append(output_dict["kl_loss"])
-                            info["loss"].append(output_dict["loss"])
+                            info["clipfrac"].append(result["clipfrac"])
+                            info["clipfrac_gt_one"].append(result.get("clipfrac_gt_one", result["clipfrac"]))
+                            info["clipfrac_lt_one"].append(result.get("clipfrac_lt_one", result["clipfrac"]))
+                            info["policy_loss"].append(result["policy_loss"])
+                            info["kl_loss"].append(result["kl_loss"])
+                            info["loss"].append(result["loss"])
 
                         adv_idx += 1
 
