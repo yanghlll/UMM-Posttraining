@@ -1,0 +1,133 @@
+================================================================================
+PART 1: game1-4 images (first batch test, old simple prompt WITHOUT player ID)
+Prompt style: format_generation_prompt_simple (old version, no player identity)
+================================================================================
+
+### Game 1 (spy=Player 2)
+Original desc: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+Modified desc: A scene containing a small blue metallic cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small gray rubber sphere in the far right corner.
+
+  Player 1 (CIV) → game1_player1_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 2 (SPY) → game1_player2_SPY.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a small blue metallic cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small gray rubber sphere in the far right corner.
+
+  Player 3 (CIV) → game1_player3_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 4 (CIV) → game1_player4_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+### Game 2 (spy=Player 1)
+Original desc: There is a small blue rubber sphere near the center. a large gray metallic cylinder on the right side. a large gray rubber cube on the left side. and a small gray metallic sphere in the far left corner.
+Modified desc: There is a small red rubber cylinder near the center. a large gray metallic cylinder on the right side. a large gray rubber cube on the left side. and a small yellow metallic sphere in the far left corner.
+
+  Player 1 (SPY) → game2_player1_SPY.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: There is a small red rubber cylinder near the center. a large gray metallic cylinder on the right side. a large gray rubber cube on the left side. and a small yellow metallic sphere in the far left corner.
+
+  Player 2 (CIV) → game2_player2_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: There is a small blue rubber sphere near the center. a large gray metallic cylinder on the right side. a large gray rubber cube on the left side. and a small gray metallic sphere in the far left corner.
+
+  Player 3 (CIV) → game2_player3_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: There is a small blue rubber sphere near the center. a large gray metallic cylinder on the right side. a large gray rubber cube on the left side. and a small gray metallic sphere in the far left corner.
+
+  Player 4 (CIV) → game2_player4_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: There is a small blue rubber sphere near the center. a large gray metallic cylinder on the right side. a large gray rubber cube on the left side. and a small gray metallic sphere in the far left corner.
+
+### Game 3 (spy=Player 2)
+Original desc: Scene description: - Object 1: a large blue metallic cube in the back - Object 2: a small purple metallic cylinder in the center - Object 3: a large brown rubber cylinder near the center
+Modified desc: Scene description: - Object 1: a large blue metallic cube in the back - Object 2: a large cyan metallic sphere in the center - Object 3: a large red rubber cube near the center
+
+  Player 1 (CIV) → game3_player1_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: Scene description: - Object 1: a large blue metallic cube in the back - Object 2: a small purple metallic cylinder in the center - Object 3: a large brown rubber cylinder near the center
+
+  Player 2 (SPY) → game3_player2_SPY.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: Scene description: - Object 1: a large blue metallic cube in the back - Object 2: a large cyan metallic sphere in the center - Object 3: a large red rubber cube near the center
+
+  Player 3 (CIV) → game3_player3_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: Scene description: - Object 1: a large blue metallic cube in the back - Object 2: a small purple metallic cylinder in the center - Object 3: a large brown rubber cylinder near the center
+
+  Player 4 (CIV) → game3_player4_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: Scene description: - Object 1: a large blue metallic cube in the back - Object 2: a small purple metallic cylinder in the center - Object 3: a large brown rubber cylinder near the center
+
+### Game 4 (spy=Player 2)
+Original desc: A scene containing a large green metallic sphere on the left side, a small gray metallic sphere near the center, a large green metallic cylinder on the right side, and a small green rubber cylinder on the left side.
+Modified desc: A scene containing a large green metallic sphere on the left side, a large gray metallic cube near the center, a large brown rubber cylinder on the right side, and a small green rubber cylinder on the left side.
+
+  Player 1 (CIV) → game4_player1_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large green metallic sphere on the left side, a small gray metallic sphere near the center, a large green metallic cylinder on the right side, and a small green rubber cylinder on the left side.
+
+  Player 2 (SPY) → game4_player2_SPY.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large green metallic sphere on the left side, a large gray metallic cube near the center, a large brown rubber cylinder on the right side, and a small green rubber cylinder on the left side.
+
+  Player 3 (CIV) → game4_player3_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large green metallic sphere on the left side, a small gray metallic sphere near the center, a large green metallic cylinder on the right side, and a small green rubber cylinder on the left side.
+
+  Player 4 (CIV) → game4_player4_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large green metallic sphere on the left side, a small gray metallic sphere near the center, a large green metallic cylinder on the right side, and a small green rubber cylinder on the left side.
+
+================================================================================
+PART 2: Prompt comparison (Game 1, 3 styles)
+Game 1: spy=Player 2
+Original desc: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+Modified desc: A scene containing a small blue metallic cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small gray rubber sphere in the far right corner.
+================================================================================
+
+### STYLE A: Old prompt (no player ID) → old_playerN_ROLE.jpg
+
+  Player 1 (CIV) → old_player1_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 2 (SPY) → old_player2_SPY.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a small blue metallic cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small gray rubber sphere in the far right corner.
+
+  Player 3 (CIV) → old_player3_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 4 (CIV) → old_player4_CIV.jpg
+  Prompt: A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+### STYLE B: New full prompt (player ID + role) → new_playerN_ROLE.jpg
+
+  Player 1 (CIV) → new_player1_CIV.jpg
+  Prompt: You are PLAYER 1 of 4 in a game of "Who's the Odd One Out?". Your role: CIVILIAN. Generate an image that faithfully represents the scene description. Your image should be consistent with other civilian players' images.
+
+Generate a high-quality image of the following 3D rendered scene. The scene contains geometric objects (cubes, spheres, cylinders) with different colors, sizes, and materials on a flat surface.
+
+Scene: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 2 (SPY) → new_player2_SPY.jpg
+  Prompt: You are PLAYER 2 of 4 in a game of "Who's the Odd One Out?". Your role: SPY. Your scene description is slightly different from the other players'. Generate an image that looks as similar as possible to what the original scene might look like, to avoid detection.
+
+Generate a high-quality image of the following 3D rendered scene. The scene contains geometric objects (cubes, spheres, cylinders) with different colors, sizes, and materials on a flat surface.
+
+Scene: A scene containing a small blue metallic cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small gray rubber sphere in the far right corner.
+
+  Player 3 (CIV) → new_player3_CIV.jpg
+  Prompt: You are PLAYER 3 of 4 in a game of "Who's the Odd One Out?". Your role: CIVILIAN. Generate an image that faithfully represents the scene description. Your image should be consistent with other civilian players' images.
+
+Generate a high-quality image of the following 3D rendered scene. The scene contains geometric objects (cubes, spheres, cylinders) with different colors, sizes, and materials on a flat surface.
+
+Scene: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 4 (CIV) → new_player4_CIV.jpg
+  Prompt: You are PLAYER 4 of 4 in a game of "Who's the Odd One Out?". Your role: CIVILIAN. Generate an image that faithfully represents the scene description. Your image should be consistent with other civilian players' images.
+
+Generate a high-quality image of the following 3D rendered scene. The scene contains geometric objects (cubes, spheres, cylinders) with different colors, sizes, and materials on a flat surface.
+
+Scene: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+### STYLE C: New simple prompt (player ID, no role) → simple_playerN_ROLE.jpg
+
+  Player 1 (CIV) → simple_player1_CIV.jpg
+  Prompt: You are Player 1 of 4. A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 2 (SPY) → simple_player2_SPY.jpg
+  Prompt: You are Player 2 of 4. A 3D rendered scene with geometric objects on a flat surface: A scene containing a small blue metallic cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small gray rubber sphere in the far right corner.
+
+  Player 3 (CIV) → simple_player3_CIV.jpg
+  Prompt: You are Player 3 of 4. A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.
+
+  Player 4 (CIV) → simple_player4_CIV.jpg
+  Prompt: You are Player 4 of 4. A 3D rendered scene with geometric objects on a flat surface: A scene containing a large brown rubber cube in the far right corner, a large purple metallic sphere in the center, a small purple rubber cube in the center, a small gray rubber cylinder in the far right corner, a small cyan rubber cylinder near the center, and a small purple metallic cube in the far right corner.

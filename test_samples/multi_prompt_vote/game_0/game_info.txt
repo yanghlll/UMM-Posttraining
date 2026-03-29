@@ -1,0 +1,179 @@
+=== Game 0 ===
+Spy player: Player 1
+Number of players: 4
+
+--- Scene Descriptions ---
+
+Player 1 [SPY]:
+There is a small green rubber cube in the back. a small blue metallic sphere on the left side. and a large yellow metallic cylinder on the left side.
+
+Player 2 [CIV]:
+There is a small green rubber cylinder in the back. a small blue metallic sphere on the left side. and a large cyan metallic cylinder on the left side.
+
+Player 3 [CIV]:
+There is a small green rubber cylinder in the back. a small blue metallic sphere on the left side. and a large cyan metallic cylinder on the left side.
+
+Player 4 [CIV]:
+There is a small green rubber cylinder in the back. a small blue metallic sphere on the left side. and a large cyan metallic cylinder on the left side.
+
+--- Voting Prompts ---
+
+========================================
+Player 1 [SPY] vote prompt:
+========================================
+You are PLAYER 1 in the game "Who's the Odd One Out?".
+
+## CRITICAL RULES — READ BEFORE ANYTHING ELSE
+- You MUST vote for exactly ONE player.
+- You CANNOT vote for yourself (Player 1). You can only vote for: Player 2, 3, 4.
+- You MUST use the exact output format specified below. Any deviation is invalid.
+
+## Your Role
+SPY: You are the spy. Your description was different from the majority. Try to blend in and avoid being detected.
+
+## Game Context
+- 4 players each generated an image from a scene description.
+- 3 players (civilians) shared the same description. 1 player (the spy) had a different one.
+- The spy's image may contain different objects, colors, or attributes.
+- Your scene description was: "There is a small green rubber cube in the back. a small blue metallic sphere on the left side. and a large yellow metallic cylinder on the left side."
+
+## Your Task
+1. Compare all 4 generated images carefully (labeled Player 1 through Player 4).
+2. Try to vote for a non-spy player to deflect suspicion. Try to blend in and act like a civilian.
+
+## Output Format (MANDATORY — follow exactly)
+You must respond with EXACTLY this structure and nothing else:
+
+<think>
+[Analyze each player's image, note differences, and explain your conclusion.]
+</think>
+<answer>
+[A SINGLE number from: 2, 3, 4]
+</answer>
+
+## Output Rules
+- The <answer> tag must contain ONLY a single number: one of 2, 3, 4.
+- Do NOT include "Player", "PLAYER", or any other text inside <answer>. Just the number.
+- Do NOT list multiple numbers. Pick exactly one.
+- Do NOT vote for 1 (that is you).
+- Do NOT output anything outside the <think> and <answer> tags.
+
+========================================
+Player 2 [CIV] vote prompt:
+========================================
+You are PLAYER 2 in the game "Who's the Odd One Out?".
+
+## CRITICAL RULES — READ BEFORE ANYTHING ELSE
+- You MUST vote for exactly ONE player.
+- You CANNOT vote for yourself (Player 2). You can only vote for: Player 1, 3, 4.
+- You MUST use the exact output format specified below. Any deviation is invalid.
+
+## Your Role
+NOT SPY: You are not the spy. Your image should be consistent with most other players' images.
+
+## Game Context
+- 4 players each generated an image from a scene description.
+- 3 players (civilians) shared the same description. 1 player (the spy) had a different one.
+- The spy's image may contain different objects, colors, or attributes.
+- Your scene description was: "There is a small green rubber cylinder in the back. a small blue metallic sphere on the left side. and a large cyan metallic cylinder on the left side."
+
+## Your Task
+1. Compare all 4 generated images carefully (labeled Player 1 through Player 4).
+2. Look for the image that seems inconsistent with the others (different objects, text, colors, positions, or style). Vote for the player you believe is the spy. There is a reward for voting correctly.
+
+## Output Format (MANDATORY — follow exactly)
+You must respond with EXACTLY this structure and nothing else:
+
+<think>
+[Analyze each player's image, note differences, and explain your conclusion.]
+</think>
+<answer>
+[A SINGLE number from: 1, 3, 4]
+</answer>
+
+## Output Rules
+- The <answer> tag must contain ONLY a single number: one of 1, 3, 4.
+- Do NOT include "Player", "PLAYER", or any other text inside <answer>. Just the number.
+- Do NOT list multiple numbers. Pick exactly one.
+- Do NOT vote for 2 (that is you).
+- Do NOT output anything outside the <think> and <answer> tags.
+
+========================================
+Player 3 [CIV] vote prompt:
+========================================
+You are PLAYER 3 in the game "Who's the Odd One Out?".
+
+## CRITICAL RULES — READ BEFORE ANYTHING ELSE
+- You MUST vote for exactly ONE player.
+- You CANNOT vote for yourself (Player 3). You can only vote for: Player 1, 2, 4.
+- You MUST use the exact output format specified below. Any deviation is invalid.
+
+## Your Role
+NOT SPY: You are not the spy. Your image should be consistent with most other players' images.
+
+## Game Context
+- 4 players each generated an image from a scene description.
+- 3 players (civilians) shared the same description. 1 player (the spy) had a different one.
+- The spy's image may contain different objects, colors, or attributes.
+- Your scene description was: "There is a small green rubber cylinder in the back. a small blue metallic sphere on the left side. and a large cyan metallic cylinder on the left side."
+
+## Your Task
+1. Compare all 4 generated images carefully (labeled Player 1 through Player 4).
+2. Look for the image that seems inconsistent with the others (different objects, text, colors, positions, or style). Vote for the player you believe is the spy. There is a reward for voting correctly.
+
+## Output Format (MANDATORY — follow exactly)
+You must respond with EXACTLY this structure and nothing else:
+
+<think>
+[Analyze each player's image, note differences, and explain your conclusion.]
+</think>
+<answer>
+[A SINGLE number from: 1, 2, 4]
+</answer>
+
+## Output Rules
+- The <answer> tag must contain ONLY a single number: one of 1, 2, 4.
+- Do NOT include "Player", "PLAYER", or any other text inside <answer>. Just the number.
+- Do NOT list multiple numbers. Pick exactly one.
+- Do NOT vote for 3 (that is you).
+- Do NOT output anything outside the <think> and <answer> tags.
+
+========================================
+Player 4 [CIV] vote prompt:
+========================================
+You are PLAYER 4 in the game "Who's the Odd One Out?".
+
+## CRITICAL RULES — READ BEFORE ANYTHING ELSE
+- You MUST vote for exactly ONE player.
+- You CANNOT vote for yourself (Player 4). You can only vote for: Player 1, 2, 3.
+- You MUST use the exact output format specified below. Any deviation is invalid.
+
+## Your Role
+NOT SPY: You are not the spy. Your image should be consistent with most other players' images.
+
+## Game Context
+- 4 players each generated an image from a scene description.
+- 3 players (civilians) shared the same description. 1 player (the spy) had a different one.
+- The spy's image may contain different objects, colors, or attributes.
+- Your scene description was: "There is a small green rubber cylinder in the back. a small blue metallic sphere on the left side. and a large cyan metallic cylinder on the left side."
+
+## Your Task
+1. Compare all 4 generated images carefully (labeled Player 1 through Player 4).
+2. Look for the image that seems inconsistent with the others (different objects, text, colors, positions, or style). Vote for the player you believe is the spy. There is a reward for voting correctly.
+
+## Output Format (MANDATORY — follow exactly)
+You must respond with EXACTLY this structure and nothing else:
+
+<think>
+[Analyze each player's image, note differences, and explain your conclusion.]
+</think>
+<answer>
+[A SINGLE number from: 1, 2, 3]
+</answer>
+
+## Output Rules
+- The <answer> tag must contain ONLY a single number: one of 1, 2, 3.
+- Do NOT include "Player", "PLAYER", or any other text inside <answer>. Just the number.
+- Do NOT list multiple numbers. Pick exactly one.
+- Do NOT vote for 4 (that is you).
+- Do NOT output anything outside the <think> and <answer> tags.

@@ -194,12 +194,7 @@ def run_bagel_vote_multi_image_repeated(inferencer, player_images: List[Image.Im
     images_rgb = [pil_img2rgb(img) for img in player_images]
 
     # Think instruction merged into vote prompt (like Bagel eval COT_MC_INSTRUCTION_V2)
-    think_prefix = (
-        'You should first think about the reasoning process in the mind and then '
-        'provide the user with the answer. The reasoning process is enclosed within '
-        '<think> </think> tags, i.e. <think> reasoning process here </think> answer here\n\n'
-    )
-    full_prompt = think_prefix + vote_prompt
+    full_prompt = vote_prompt
 
     results = []
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
@@ -241,8 +236,7 @@ def run_bagel_vote_multi_image_repeated(inferencer, player_images: List[Image.Im
         # NaiveCache KV format: [seq_len, heads, dim] (packed, no batch dim)
         # K copies: [K*seq_len, heads, dim] via repeat (concatenation in packed space)
         # prepare_start_tokens naturally builds correct indexes for K sequences
-        from flow_grpo.bagel.modeling.bagel.qwen2_navit import NaiveCache as _NC
-        batch_kv = _NC(model.config.llm_config.num_hidden_layers)
+        batch_kv = NaiveCache(model.config.llm_config.num_hidden_layers)
         for layer_idx in range(model.config.llm_config.num_hidden_layers):
             orig_k = past_key_values.key_cache[layer_idx]  # [S, heads, dim]
             orig_v = past_key_values.value_cache[layer_idx]
@@ -635,12 +629,7 @@ def sample_vote_with_logprobs(inferencer, player_images: List[Image.Image],
     images_rgb = [pil_img2rgb(img) for img in player_images]
 
     # Think instruction merged into vote prompt (Bagel eval style)
-    think_prefix = (
-        'You should first think about the reasoning process in the mind and then '
-        'provide the user with the answer. The reasoning process is enclosed within '
-        '<think> </think> tags, i.e. <think> reasoning process here </think> answer here\n\n'
-    )
-    full_prompt = think_prefix + vote_prompt
+    full_prompt = vote_prompt
 
     results = []
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
@@ -681,8 +670,7 @@ def sample_vote_with_logprobs(inferencer, player_images: List[Image.Image],
         prompt_len = newlens[0]
 
         # ── Batched generation: K votes in one packed forward pass ──
-        from flow_grpo.bagel.modeling.bagel.qwen2_navit import NaiveCache as _NC
-        batch_kv = _NC(model.config.llm_config.num_hidden_layers)
+        batch_kv = NaiveCache(model.config.llm_config.num_hidden_layers)
         for layer_idx in range(model.config.llm_config.num_hidden_layers):
             orig_k = past_key_values.key_cache[layer_idx]
             orig_v = past_key_values.value_cache[layer_idx]
@@ -758,12 +746,37 @@ def compute_decision_rewards(vote_samples, spy_player, num_players, extract_vote
         text = vs['text']
         extracted = extract_vote_fn(text)
 
-        # Format check (Vision-Zero style): need <think> content (>10 chars) + valid answer
+        # Format check: reasoning content + single valid answer
         import re as _re
-        think_match = _re.search(r'<think>(.*?)</think>', text, _re.DOTALL)
-        has_think = think_match is not None and len(think_match.group(1).strip()) > 10
         has_answer = extracted is not None and extracted.get("voted_spy") is not None
-        fmt_ok = has_think and has_answer
+
+        # Check for reasoning (flexible: <think> tags OR free text before answer)
+        has_reasoning = False
+        think_match = _re.search(r'<think>(.*?)</think>', text, _re.DOTALL)
+        if think_match and len(think_match.group(1).strip()) > 10:
+            has_reasoning = True  # explicit <think> tags with content
+        else:
+            # No <think> tags — check for free-form reasoning before the answer
+            boxed_pos = _re.search(r'\\\\?boxed\{', text)
+            answer_pos = _re.search(r'<answer>', text)
+            ans_start = None
+            if boxed_pos:
+                ans_start = boxed_pos.start()
+            elif answer_pos:
+                ans_start = answer_pos.start()
+            if ans_start is not None and len(text[:ans_start].strip()) > 10:
+                has_reasoning = True  # substantial text before answer
+
+        # Penalize multiple answers: multiple tags OR multiple numbers in single tag
+        num_boxed = len(_re.findall(r'\\\\?boxed\{', text))
+        num_answer_tags = len(_re.findall(r'<answer>', text))
+        has_multiple_answers = (num_boxed > 1) or (num_answer_tags > 1)
+        # extract_vote returns None when answer content has multiple numbers
+        # (e.g. \boxed{1, 3}) — also treat as multiple answers
+        if not has_multiple_answers and extracted is None and (num_boxed > 0 or num_answer_tags > 0):
+            has_multiple_answers = True
+
+        fmt_ok = has_reasoning and has_answer and not has_multiple_answers
 
         # Accuracy check
         if extracted and isinstance(extracted.get("voted_spy"), int):
@@ -804,12 +817,7 @@ def build_vote_kv_cache(model, tokenizer, new_token_ids, player_images, vote_pro
     lm_unwrapped = lm.module if hasattr(lm, 'module') else lm
     extra_inputs = {"mode": "und"} if model.use_moe else {}
 
-    think_prefix = (
-        'You should first think about the reasoning process in the mind and then '
-        'provide the user with the answer. The reasoning process is enclosed within '
-        '<think> </think> tags, i.e. <think> reasoning process here </think> answer here\n\n'
-    )
-    full_prompt = think_prefix + vote_prompt
+    full_prompt = vote_prompt
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
         past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
@@ -869,7 +877,6 @@ def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
     """
     from flow_grpo.bagel.data.data_utils import pil_img2rgb
     from flow_grpo.bagel.modeling.bagel.qwen2_navit import NaiveCache
-    from copy import deepcopy
 
     vlm_transform = build_vlm_image_transform()
     device = next(model.parameters()).device
@@ -936,7 +943,7 @@ def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
                 query_lens=query_lens,
                 packed_query_position_ids=packed_query_position_ids,
                 packed_query_indexes=packed_query_indexes,
-                past_key_values=deepcopy(past_key_values),
+                past_key_values=past_key_values,  # no deepcopy needed: update_past_key_values=False
                 key_values_lens=torch.tensor(newlens, dtype=torch.int, device=device),
                 packed_key_value_indexes=pki,
                 update_past_key_values=False,
@@ -948,8 +955,9 @@ def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
             ref_log_probs = ref_log_probs_all.gather(1, target_ids.unsqueeze(1)).squeeze(1)
 
         # Vision-Zero KL: exp(ref - new) - (ref - new) - 1
-        per_token_kl = (torch.exp(ref_log_probs - new_log_probs.detach()) -
-                        (ref_log_probs - new_log_probs.detach()) - 1)
+        # ref_log_probs is detached (computed under no_grad), gradients flow through new_log_probs
+        per_token_kl = (torch.exp(ref_log_probs - new_log_probs) -
+                        (ref_log_probs - new_log_probs) - 1)
 
     # ── Step 4: PPO-clip loss ──
     adv = torch.tensor(advantage, dtype=torch.float32, device=device)

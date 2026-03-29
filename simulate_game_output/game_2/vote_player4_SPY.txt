@@ -1,0 +1,38 @@
+=== Player 4 (SPY) Vote ===
+
+Prompt:
+You are PLAYER 4 of the game "Who's the Odd One Out?". Each player generated an image from a scene description. Now this is the decision-making stage. Your task is to vote on who is the Odd Player.
+
+Your role: SPY (your description was different)
+• You are the spy with a slightly different scene description. Your generated image may look different from what others generated.
+
+Your scene description (used to generate your image) was:
+"A close-up of an artist's paint palette titled "Moody Special", featuring a range of deep blue and indigo hues, with a few strokes of white to add contrast. The palette is slightly worn, showing signs of frequent use, with the paint mixed in a swirling, textured pattern."
+
+Game Instructions:
+• There are 4 players in total. Only one player (the spy) had a different description.
+• The player voted as the odd player will be severely punished. Therefore all players will try to convince others that they are not the odd player.
+• The spy's image may have different objects or attributes compared to the majority.
+• You can see all 4 players' generated images above, labeled "Player 1's generated image" through "Player 4's generated image".
+
+What you should do:
+1. Compare all 4 generated images carefully.
+2. You are the spy: Vote for someone else to avoid suspicion. Choose another player to vote for, but DON'T vote for yourself as that would reveal your identity.
+
+Required output format:
+<think>
+your private step-by-step reasoning — may include suspicions, probabilities, deception, etc.
+</think>
+<answer>
+PLAYER_NUMBER or N/A
+Example answer: 1; 2; 3; N/A. (Just number or N/A, don't contain any other text)
+If you are uncertain about who is the spy, you can answer N/A. This will result in a smaller penalty than guessing incorrectly.
+</answer>
+
+Response (10 tokens):
+<answer>
+一股 N/A；
+</answer>
+
+Extracted vote: None
+Correct: False

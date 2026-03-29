@@ -1,0 +1,31 @@
+=== Reward Comparison ===
+
+Spy: Player 1
+
+--- Method A (grid) ---
+  Vote counts: {1: 3, 2: 0, 3: 1, 4: 0}
+  Spy caught: True
+  P1 [SPY]: reward=-0.2667
+  P2 [CIV]: reward=+0.1222
+  P3 [CIV]: reward=+0.0222
+  P4 [CIV]: reward=+0.1222
+  Sum: 0.000000
+
+--- Method B (multi-prompt) ---
+  Vote counts: {1: 4, 2: 0, 3: 0, 4: 0}
+  Spy caught: True
+  P1 [SPY]: reward=-0.4000
+  P2 [CIV]: reward=+0.1333
+  P3 [CIV]: reward=+0.1333
+  P4 [CIV]: reward=+0.1333
+  Sum: -0.000000
+
+--- Method C (interleave) ---
+  Vote counts: {1: 3, 2: 0, 3: 1, 4: 0}
+  Spy caught: True
+  P1 [SPY]: reward=-0.2667
+  P2 [CIV]: reward=+0.1222
+  P3 [CIV]: reward=+0.0222
+  P4 [CIV]: reward=+0.1222
+  Sum: 0.000000
+

@@ -1040,10 +1040,10 @@ def spy_game_bagel():
     config.sample.sde_window_range = (0, config.sample.num_steps // 2)
 
     # Training
-    config.train.num_inner_epochs = 2
+    config.train.num_inner_epochs = 1
     config.train.clip_range_lt = 1e-5       # flow_grpo bagel default (diffusion SDE ratio clipping)
     config.train.clip_range_gt = 1e-5       # flow_grpo bagel default (diffusion SDE ratio clipping)
-    config.train.beta = 0.04                 # KL penalty for generation (Vision-Zero: 0.04)
+    config.train.beta = 0                    # Gen KL off (ref model offloaded to CPU during gen phase)
     config.train.learning_rate = 1e-4       # flow_grpo bagel default
     config.train.cfg = True
     config.train.ema = False
@@ -1075,6 +1075,8 @@ def spy_game_bagel():
     config.spy_game.decision_weight_decay = 0.01  # AdamW weight decay (Vision-Zero: 0.01)
     config.spy_game.decision_lambda_fmt = 0.3     # Format reward weight
     config.spy_game.decision_beta_acc = 1.2       # Accuracy reward weight
+    config.spy_game.decision_warmup_ratio = 0.1   # Vision-Zero: 0.1
+    config.spy_game.decision_lr_scheduler = 'cosine'  # Vision-Zero: cosine
 
     config.activation_checkpointing = True
 
@@ -1082,7 +1084,7 @@ def spy_game_bagel():
     config.save_freq = 100
     config.eval_freq = 100
     config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel'
-    config.num_epochs = 100000
+    config.num_epochs = 4000
 
     return config
 
@@ -1119,13 +1121,13 @@ def spy_game_bagel_geneval():
 def spy_game_bagel_pickscore():
     """Bagel training with spy-civ self-play on pickscore natural scene data."""
     config = spy_game_bagel()
-    config.run_name = "[bagel-spy-pickscore-decision]-4gpu"
+    config.run_name = "[bagel-spy-pickscore-interactive]-4gpu"
     config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/pickscore_sfw"
     config.spy_game.prompt_type = "pickscore"
     config.spy_game.god_sees_description = True
     config.spy_game.decision_training = True
-    config.spy_game.phase_cycle_length = 100000  # Only decision phase (never switch to gen)
-    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore_decision'
+    config.spy_game.phase_cycle_length = 1  # Switch phase every 1 step (fast test)
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore_interactive'
     return config
 
 

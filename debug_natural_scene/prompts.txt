@@ -1,0 +1,240 @@
+
+================================================================================
+GAME: pickscore_1
+  Original:  , fantasy, pastel, absurdist, photo, Wes anderson, hornet characters
+  Modified:  , fantasy, pastel, absurdist, photo, Wes anderson, hornet characters, next to a blue car.
+  Change:    added: next to a blue car
+  Spy:       Player 3
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. , fantasy, pastel, absurdist, photo, Wes anderson, hornet characters
+  Image:  pickscore_1_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. , fantasy, pastel, absurdist, photo, Wes anderson, hornet characters
+  Image:  pickscore_1_player2_CIV.jpg
+
+  Player 3 (SPY)
+  Prompt: You are Player 3 of 4. , fantasy, pastel, absurdist, photo, Wes anderson, hornet characters, next to a blue car.
+  Image:  pickscore_1_player3_SPY.jpg
+
+  Player 4 (CIV)
+  Prompt: You are Player 4 of 4. , fantasy, pastel, absurdist, photo, Wes anderson, hornet characters
+  Image:  pickscore_1_player4_CIV.jpg
+
+================================================================================
+GAME: pickscore_2
+  Original:  fantasy digital art midjourney, deer, flowers and birds on a big antlers, unrealism
+  Modified:  fantasy digital art midjourney, deer, flowers and birds on a tiny antlers, unrealism
+  Change:    size: big→tiny
+  Spy:       Player 2
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. fantasy digital art midjourney, deer, flowers and birds on a big antlers, unrealism
+  Image:  pickscore_2_player1_CIV.jpg
+
+  Player 2 (SPY)
+  Prompt: You are Player 2 of 4. fantasy digital art midjourney, deer, flowers and birds on a tiny antlers, unrealism
+  Image:  pickscore_2_player2_SPY.jpg
+
+  Player 3 (CIV)
+  Prompt: You are Player 3 of 4. fantasy digital art midjourney, deer, flowers and birds on a big antlers, unrealism
+  Image:  pickscore_2_player3_CIV.jpg
+
+  Player 4 (CIV)
+  Prompt: You are Player 4 of 4. fantasy digital art midjourney, deer, flowers and birds on a big antlers, unrealism
+  Image:  pickscore_2_player4_CIV.jpg
+
+================================================================================
+GAME: ocr_1
+  Original:  A mad scientist stands in a cluttered lab, wearing a lab coat with a prominent patch that reads "I Toxic Waste". Shelves lined with colorful chemicals and strange machinery surround him, while a bubbling green liquid in a beaker on the table adds to the chaotic atmosphere.
+  Modified:  A mad scientist stands in a cluttered lab, wearing a lab coat with a prominent patch that reads "I Amazing Waste". Shelves lined with colorful chemicals and strange machinery surround him, while a bubbling green liquid in a beaker on the table adds to the chaotic atmosphere.
+  Change:    text word: "Toxic"→"Amazing"
+  Spy:       Player 3
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. A mad scientist stands in a cluttered lab, wearing a lab coat with a prominent patch that reads "I Toxic Waste". Shelves lined with colorful chemicals and strange machinery surround him, while a bubbling green liquid in a beaker on the table adds to the chaotic atmosphere.
+  Image:  ocr_1_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. A mad scientist stands in a cluttered lab, wearing a lab coat with a prominent patch that reads "I Toxic Waste". Shelves lined with colorful chemicals and strange machinery surround him, while a bubbling green liquid in a beaker on the table adds to the chaotic atmosphere.
+  Image:  ocr_1_player2_CIV.jpg
+
+  Player 3 (SPY)
+  Prompt: You are Player 3 of 4. A mad scientist stands in a cluttered lab, wearing a lab coat with a prominent patch that reads "I Amazing Waste". Shelves lined with colorful chemicals and strange machinery surround him, while a bubbling green liquid in a beaker on the table adds to the chaotic atmosphere.
+  Image:  ocr_1_player3_SPY.jpg
+
+  Player 4 (CIV)
+  Prompt: You are Player 4 of 4. A mad scientist stands in a cluttered lab, wearing a lab coat with a prominent patch that reads "I Toxic Waste". Shelves lined with colorful chemicals and strange machinery surround him, while a bubbling green liquid in a beaker on the table adds to the chaotic atmosphere.
+  Image:  ocr_1_player4_CIV.jpg
+
+================================================================================
+GAME: ocr_2
+  Original:  A close-up of a vintage library stamp, clearly marking documents with the text "Archived 1923", set against a backdrop of aged, yellowed paper and old book bindings.
+  Modified:  A close-up of a vintage library stamp, clearly marking documents with the text "Archived Amazing", set against a backdrop of aged, yellowed paper and old book bindings.
+  Change:    text word: "1923"→"Amazing"
+  Spy:       Player 3
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. A close-up of a vintage library stamp, clearly marking documents with the text "Archived 1923", set against a backdrop of aged, yellowed paper and old book bindings.
+  Image:  ocr_2_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. A close-up of a vintage library stamp, clearly marking documents with the text "Archived 1923", set against a backdrop of aged, yellowed paper and old book bindings.
+  Image:  ocr_2_player2_CIV.jpg
+
+  Player 3 (SPY)
+  Prompt: You are Player 3 of 4. A close-up of a vintage library stamp, clearly marking documents with the text "Archived Amazing", set against a backdrop of aged, yellowed paper and old book bindings.
+  Image:  ocr_2_player3_SPY.jpg
+
+  Player 4 (CIV)
+  Prompt: You are Player 4 of 4. A close-up of a vintage library stamp, clearly marking documents with the text "Archived 1923", set against a backdrop of aged, yellowed paper and old book bindings.
+  Image:  ocr_2_player4_CIV.jpg
+
+================================================================================
+GAME: geneval_color_1
+  Original:  a photo of a pink toilet and a brown teddy bear
+  Modified:  a photo of a pink toilet and a purple teddy bear
+  Change:    color: brown→purple
+  Spy:       Player 4
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. a photo of a pink toilet and a brown teddy bear
+  Image:  geneval_color_1_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. a photo of a pink toilet and a brown teddy bear
+  Image:  geneval_color_1_player2_CIV.jpg
+
+  Player 3 (CIV)
+  Prompt: You are Player 3 of 4. a photo of a pink toilet and a brown teddy bear
+  Image:  geneval_color_1_player3_CIV.jpg
+
+  Player 4 (SPY)
+  Prompt: You are Player 4 of 4. a photo of a pink toilet and a purple teddy bear
+  Image:  geneval_color_1_player4_SPY.jpg
+
+================================================================================
+GAME: geneval_color_2
+  Original:  a photo of a green scissors
+  Modified:  a photo of a yellow scissors
+  Change:    color: green→yellow
+  Spy:       Player 3
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. a photo of a green scissors
+  Image:  geneval_color_2_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. a photo of a green scissors
+  Image:  geneval_color_2_player2_CIV.jpg
+
+  Player 3 (SPY)
+  Prompt: You are Player 3 of 4. a photo of a yellow scissors
+  Image:  geneval_color_2_player3_SPY.jpg
+
+  Player 4 (CIV)
+  Prompt: You are Player 4 of 4. a photo of a green scissors
+  Image:  geneval_color_2_player4_CIV.jpg
+
+================================================================================
+GAME: geneval_count_1
+  Original:  a photo of three baseball gloves
+  Modified:  a photo of four baseball gloves
+  Change:    count: three→four
+  Spy:       Player 4
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. a photo of three baseball gloves
+  Image:  geneval_count_1_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. a photo of three baseball gloves
+  Image:  geneval_count_1_player2_CIV.jpg
+
+  Player 3 (CIV)
+  Prompt: You are Player 3 of 4. a photo of three baseball gloves
+  Image:  geneval_count_1_player3_CIV.jpg
+
+  Player 4 (SPY)
+  Prompt: You are Player 4 of 4. a photo of four baseball gloves
+  Image:  geneval_count_1_player4_SPY.jpg
+
+================================================================================
+GAME: geneval_count_2
+  Original:  a photo of two sports balls
+  Modified:  a photo of three sports balls
+  Change:    count: two→three
+  Spy:       Player 3
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. a photo of two sports balls
+  Image:  geneval_count_2_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. a photo of two sports balls
+  Image:  geneval_count_2_player2_CIV.jpg
+
+  Player 3 (SPY)
+  Prompt: You are Player 3 of 4. a photo of three sports balls
+  Image:  geneval_count_2_player3_SPY.jpg
+
+  Player 4 (CIV)
+  Prompt: You are Player 4 of 4. a photo of two sports balls
+  Image:  geneval_count_2_player4_CIV.jpg
+
+================================================================================
+GAME: geneval_pos_1
+  Original:  a photo of a sheep left of a bear
+  Modified:  a photo of a sheep right of a bear
+  Change:    position: left→right
+  Spy:       Player 4
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. a photo of a sheep left of a bear
+  Image:  geneval_pos_1_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. a photo of a sheep left of a bear
+  Image:  geneval_pos_1_player2_CIV.jpg
+
+  Player 3 (CIV)
+  Prompt: You are Player 3 of 4. a photo of a sheep left of a bear
+  Image:  geneval_pos_1_player3_CIV.jpg
+
+  Player 4 (SPY)
+  Prompt: You are Player 4 of 4. a photo of a sheep right of a bear
+  Image:  geneval_pos_1_player4_SPY.jpg
+
+================================================================================
+GAME: geneval_pos_2
+  Original:  a photo of a couch below a sink
+  Modified:  a photo of a couch above a sink
+  Change:    position: below→above
+  Spy:       Player 3
+================================================================================
+
+  Player 1 (CIV)
+  Prompt: You are Player 1 of 4. a photo of a couch below a sink
+  Image:  geneval_pos_2_player1_CIV.jpg
+
+  Player 2 (CIV)
+  Prompt: You are Player 2 of 4. a photo of a couch below a sink
+  Image:  geneval_pos_2_player2_CIV.jpg
+
+  Player 3 (SPY)
+  Prompt: You are Player 3 of 4. a photo of a couch above a sink
+  Image:  geneval_pos_2_player3_SPY.jpg
+
+  Player 4 (CIV)
+  Prompt: You are Player 4 of 4. a photo of a couch below a sink
+  Image:  geneval_pos_2_player4_CIV.jpg

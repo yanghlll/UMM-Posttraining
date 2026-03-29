@@ -303,117 +303,97 @@ class SpyGameDataGenerator:
             # God judge perspective
             if god_sees_description:
                 orig_desc = game_data.get("original_description", "")
-                desc_block = (
-                    f'The original scene description (what non-spy players received) is:\n'
-                    f'"{orig_desc}"\n\n'
-                )
+                # desc_block = (
+                #     f'The original scene description (what non-spy players received) is:\n'
+                #     f'"{orig_desc}"\n\n'
+                # )
                 compare_instruction = (
                     f'1. Compare each image against the original description above.\n'
                     f'2. Look for the image that deviates from the description '
                     f'(e.g. different objects, colors, attributes, or positions).\n'
                 )
             else:
-                desc_block = ''
+                orig_desc = ''
                 compare_instruction = (
                     f'1. Compare all {N} images carefully.\n'
                     f'2. Look for objects that appear different in one image compared to the others.\n'
                 )
 
-
-
-Your task:
-Analyze all the clues and determine which player is most likely the spy. Look for:
-1. Clues that seem inconsistent with the majority
-2. Clues that are deliberately vague or generic
-3. Clues that might be trying to mislead others
-4. Patterns that suggest deception or uncertainty
-
-The image you see shows the ORIGINAL picture (what non-spy players see). Compare 
-the clues against this reference.
-
-
             return (
                 f'You are analyzing a game of "Who\'s the Odd One Out?" where '
-                f'{N} players each generated an image from their scene description. '
-                f'Your task is to identify which player is the spy (the one with the different description) based on their generated images.\n'
-                f'Game Setup:\n'
-                f'• There are {N} players in total. Only one player sees a different description (the spy), and the description seen by all other players are the same.'
-                f'• In the spy's description, two objects are replaced with different ones, but they remain 
-  in the same positions as in the original image.'
-
-• Each player provided a clue trying to describe their picture while avoiding suspicion.
-• The spy tries to blend in by giving clues that seem consistent with what others see.
-• Non-spy players try to give distinctive clues that help identify the spy.
-'
-                f'{desc_block}'
-                f'You can see all {N} players\' generated images above, '
-                f'labeled "Player 1\'s generated image" through "Player {N}\'s generated image".\n\n'
+                f'{N} players each generated an image from a scene description.\n\n'
+                f'## Game Context\n'
+                f'- {N} players each generated an image from a scene description.\n'
+                f'- {N - 1} players (civilians) shared the same description. 1 player (the spy) had a different one.\n'
+                f'- The spy\'s image may differ from the others in one of the following: color, size, count, material, or style.\n'
+                f'- Your scene description was: "{orig_desc}"\n\n'
                 f'What you should do:\n'
                 f'{compare_instruction}'
                 f'3. Identify which player generated the odd image.\n\n'
                 f'Required output format:\n'
-                f'First, conduct your step-by-step reasoning analyzing each image and comparing them.\n'
-                f'Then, put your final answer (PLAYER_NUMBER or N/A) inside \boxed{}. If you are uncertain, you can answer N/A.\n'
-                f'Example answer: \boxed{1}; \boxed{2}; \boxed{3}; \boxed{N/A}.'
+                f'First, conduct your private step-by-step reasoning analyzing each image.\n'
+                f'Then, put your final answer (PLAYER_NUMBER or N/A) inside \\boxed{{}}.\n'
+                f'If you are uncertain, you can answer N/A.\n'
+                f'Example answer: \\boxed{1}; \\boxed{2}; \\boxed{3}; \\boxed{4}; \\boxed{{N/A}}.'
             )
 
-        spy_player = game_data["spy_player"]
-        scene_desc = game_data["player_descriptions"][player_id - 1]
-        role = "SPY" if player_id == spy_player else "CIV"
+        # spy_player = game_data["spy_player"]
+        # scene_desc = game_data["player_descriptions"][player_id - 1]
+        # role = "SPY" if player_id == spy_player else "CIV"
 
-        role_text = "NOT SPY" if role == "CIV" else "SPY"
+        # role_text = "NOT SPY" if role == "CIV" else "SPY"
 
-        if role == "CIV":
-            role_detail = "You are not the spy. Your image should be consistent with most other players' images."
-            vote_instruction = (
-                "Look for the image that seems inconsistent with the others "
-                "(different objects, text, colors, positions, or style). Vote for the player you believe is the spy. "
-                "There is a reward for voting correctly."
-            )
-        else:
-            role_detail = (
-                "You are the spy. Your description was different from the majority. "
-                "Try to blend in and avoid being detected."
-            )
-            vote_instruction = (
-                "Try to vote for a non-spy player to deflect suspicion. "
-                "Try to blend in and act like a civilian."
-            )
+        # if role == "CIV":
+        #     role_detail = "You are not the spy. Your image should be consistent with most other players' images."
+        #     vote_instruction = (
+        #         "Look for the image that seems inconsistent with the others "
+        #         "(different objects, text, colors, positions, or style). Vote for the player you believe is the spy. "
+        #         "There is a reward for voting correctly."
+        #     )
+        # else:
+        #     role_detail = (
+        #         "You are the spy. Your description was different from the majority. "
+        #         "Try to blend in and avoid being detected."
+        #     )
+        #     vote_instruction = (
+        #         "Try to vote for a non-spy player to deflect suspicion. "
+        #         "Try to blend in and act like a civilian."
+        #     )
 
-        other_players = [p for p in range(1, N + 1) if p != player_id]
-        other_players_str = ", ".join(str(p) for p in other_players)
+        # other_players = [p for p in range(1, N + 1) if p != player_id]
+        # other_players_str = ", ".join(str(p) for p in other_players)
 
-        return (
-            f'You are PLAYER {player_id} in the game "Who\'s the Odd One Out?".\n\n'
-            f'## CRITICAL RULES — READ BEFORE ANYTHING ELSE\n'
-            f'- You MUST vote for exactly ONE player.\n'
-            f'- You CANNOT vote for yourself (Player {player_id}). You can only vote for: Player {other_players_str}.\n'
-            f'- You MUST use the exact output format specified below. Any deviation is invalid.\n\n'
-            f'## Your Role\n'
-            f'{role_text}: {role_detail}\n\n'
-            f'## Game Context\n'
-            f'- {N} players each generated an image from a scene description.\n'
-            f'- {N - 1} players (civilians) shared the same description. 1 player (the spy) had a different one.\n'
-            f'- The spy\'s image may contain different objects, colors, or attributes.\n'
-            f'- Your scene description was: "{scene_desc}"\n\n'
-            f'## Your Task\n'
-            f'1. Compare all {N} generated images carefully (labeled Player 1 through Player {N}).\n'
-            f'2. {vote_instruction}\n\n'
-            f'## Output Format (MANDATORY — follow exactly)\n'
-            f'You must respond with EXACTLY this structure and nothing else:\n\n'
-            f'<think>\n'
-            f'Analyze and compare the images of other players. Identify which image is the most mismatched with the others, and explain your reasons.\n'
-            f'</think>\n'
-            f'<answer>\n'
-            f'[A SINGLE number from: {other_players_str}]\n'
-            f'</answer>\n\n'
-            f'## Output Rules\n'
-            f'- The <answer> tag must contain ONLY a single number: one of {other_players_str}.\n'
-            f'- Do NOT include "Player", "PLAYER", or any other text inside <answer>. Just the number.\n'
-            f'- Do NOT list multiple numbers. Pick exactly one.\n'
-            f'- Do NOT vote for {player_id} (that is you).\n'
-            f'- Do NOT output anything outside the <think> and <answer> tags.'
-        )
+        # return (
+        #     f'You are PLAYER {player_id} in the game "Who\'s the Odd One Out?".\n\n'
+        #     f'## CRITICAL RULES — READ BEFORE ANYTHING ELSE\n'
+        #     f'- You MUST vote for exactly ONE player.\n'
+        #     f'- You CANNOT vote for yourself (Player {player_id}). You can only vote for: Player {other_players_str}.\n'
+        #     f'- You MUST use the exact output format specified below. Any deviation is invalid.\n\n'
+        #     f'## Your Role\n'
+        #     f'{role_text}: {role_detail}\n\n'
+        #     f'## Game Context\n'
+        #     f'- {N} players each generated an image from a scene description.\n'
+        #     f'- {N - 1} players (civilians) shared the same description. 1 player (the spy) had a different one.\n'
+        #     f'- The spy\'s image may contain different objects, colors, or attributes.\n'
+        #     f'- Your scene description was: "{scene_desc}"\n\n'
+        #     f'## Your Task\n'
+        #     f'1. Compare all {N} generated images carefully.\n'
+        #     f'2. {vote_instruction}\n\n'
+        #     f'## Output Format (MANDATORY — follow exactly)\n'
+        #     f'You must respond with EXACTLY this structure and nothing else:\n\n'
+        #     f'<think>\n'
+        #     f'Analyze and compare the images of other players. Identify which image is the most mismatched with the others, and explain your reasons.\n'
+        #     f'</think>\n'
+        #     f'<answer>\n'
+        #     f'[A SINGLE number from: {other_players_str}]\n'
+        #     f'</answer>\n\n'
+        #     f'## Output Rules\n'
+        #     f'- The <answer> tag must contain ONLY a single number: one of {other_players_str}.\n'
+        #     f'- Do NOT include "Player", "PLAYER", or any other text inside <answer>. Just the number.\n'
+        #     f'- Do NOT list multiple numbers. Pick exactly one.\n'
+        #     f'- Do NOT vote for {player_id} (that is you).\n'
+        #     f'- Do NOT output anything outside the <think> and <answer> tags.'
+        # )
 
     def extract_vote(self, response):
         """Extract vote from response text (Vision-Zero style).
@@ -425,6 +405,12 @@ the clues against this reference.
         """
         if not response or not isinstance(response, str):
             return None
+
+        # Reject multiple answer tags outright (e.g. \boxed{1}; \boxed{2}; ...)
+        num_boxed = len(re.findall(r'\\\\?boxed\{', response))
+        num_answer_tags = len(re.findall(r'<answer>', response))
+        if num_boxed > 1 or num_answer_tags > 1:
+            return None  # Multiple answers = invalid
 
         answer_content = None
 
@@ -444,7 +430,6 @@ the clues against this reference.
             m = re.search(r'<answer>\s*(.*)', response, re.DOTALL)
             if m:
                 answer_content = m.group(1).strip()
-                # Clean up any extra tags
                 answer_content = re.split(r'</answer>|<think>|<answer>', answer_content)[0].strip()
 
         # Extract vote from answer_content
@@ -452,10 +437,11 @@ the clues against this reference.
             if answer_content.strip().upper() in ("N/A", "NA"):
                 return {"voted_spy": "N/A"}
             nums = re.findall(r'\b([1-9])\b', answer_content)
-            if nums:
+            if len(nums) == 1:
                 return {"voted_spy": int(nums[0])}
+            # Multiple numbers or no numbers in answer → invalid
+            return None
 
-        # No valid format found → invalid vote (no fallback to avoid think contamination)
         return None
 
     def calculate_game_rewards(self, game_data, player_votes):

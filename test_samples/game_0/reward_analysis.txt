@@ -1,0 +1,15 @@
+=== Reward Analysis ===
+
+Spy: Player 2
+Total votes: 32 (4 players x 8 votes)
+Vote counts: {1: 11, 2: 2, 3: 13, 4: 6}
+Spy (P2) received: 2 votes
+Spy caught: False
+
+--- Zero-sum Rewards (Vision-Zero formula) ---
+  P1 [CIV]: -0.3667
+  P2 [SPY]: +0.8000
+  P3 [CIV]: -0.5667
+  P4 [CIV]: +0.1333
+
+  Sum: 0.000000 (should be 0)

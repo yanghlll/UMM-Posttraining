@@ -1,0 +1,28 @@
+=== Single Vote per Player (via interleave_inference) ===
+
+--- Player 1 [SPY] ---
+Voted for: Player 3
+Time: 0.4s
+Full response:
+3
+
+--- Player 2 [CIV] ---
+Voted for: Player 3
+Time: 0.6s
+Full response:
+<answer>
+3
+</answer>
+
+--- Player 3 [CIV] ---
+Voted for: Player 3
+Time: 2.2s
+Full response:
+Player 3's generated image shows a small cyan rubber cylinder in the back, a small green rubber sphere on the left side, and a small blue metallic cylinder in the far right corner. There is no small red metallic sphere present. Therefore, Player 3 is the odd one out.
+
+--- Player 4 [CIV] ---
+Voted for: Player 3
+Time: 0.4s
+Full response:
+3
+

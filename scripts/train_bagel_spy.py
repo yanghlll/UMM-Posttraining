@@ -496,6 +496,7 @@ def main(_):
     )
 
     decision_training = spy_cfg.get('decision_training', False)
+    und_scheduler = None
     if decision_training:
         und_params = [p for n, p in transformer.named_parameters()
                       if 'moe_gen' not in n and p.requires_grad]
@@ -506,16 +507,29 @@ def main(_):
             weight_decay=spy_cfg.get('decision_weight_decay', 0.01),
             eps=1e-8,
         )
+        # Warmup + cosine scheduler (Vision-Zero: warmup_ratio=0.1, cosine)
+        total_decision_steps = config.num_epochs  # 1 step per epoch
+        warmup_steps = int(total_decision_steps * spy_cfg.get('decision_warmup_ratio', 0.1))
+        if spy_cfg.get('decision_lr_scheduler', 'cosine') == 'cosine':
+            from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+            warmup_scheduler = LinearLR(und_optimizer, start_factor=0.01, total_iters=max(warmup_steps, 1))
+            cosine_scheduler = CosineAnnealingLR(und_optimizer, T_max=max(total_decision_steps - warmup_steps, 1))
+            und_scheduler = SequentialLR(und_optimizer, [warmup_scheduler, cosine_scheduler],
+                                         milestones=[warmup_steps])
         logger.info(f"  Decision training: ENABLED (und params: {len(und_params)}, "
-                     f"lr={spy_cfg.get('decision_lr', 1e-5)})")
+                     f"lr={spy_cfg.get('decision_lr', 1e-5)}, warmup={warmup_steps}, "
+                     f"scheduler={spy_cfg.get('decision_lr_scheduler', 'cosine')})")
     else:
         und_optimizer = None
 
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
 
     if decision_training:
-        transformer, gen_optimizer, und_optimizer = accelerator.prepare(
-            transformer, gen_optimizer, und_optimizer)
+        # Only prepare transformer + gen_optimizer with Accelerator (DDP wrapping).
+        # und_optimizer stays as raw PyTorch optimizer — we handle its gradient sync
+        # manually via all_reduce. This allows us to offload its states to CPU
+        # during generation phase to avoid OOM.
+        transformer, gen_optimizer = accelerator.prepare(transformer, gen_optimizer)
     else:
         transformer, gen_optimizer = accelerator.prepare(transformer, gen_optimizer)
     model.language_model = transformer
@@ -584,11 +598,30 @@ def main(_):
         else:
             logger.warning(f"Resume checkpoint not found: {ckpt_file}, training from scratch")
 
+    # One-time training mode setup (avoid per-epoch layer traversal)
+    transformer.train()
+    _unwrapped_setup = accelerator.unwrap_model(transformer)
+    _unwrapped_setup.training = False
+    _unwrapped_setup.model.training = False
+    if config.use_lora:
+        _unwrapped_setup.model.model.training = False
+        for _layer in _unwrapped_setup.model.model.layers:
+            _layer.training = False
+            if hasattr(_layer, 'self_attn'):
+                _layer.self_attn.training = False
+    else:
+        for _layer in _unwrapped_setup.model.layers:
+            _layer.training = False
+            if hasattr(_layer, 'self_attn'):
+                _layer.self_attn.training = False
+    del _unwrapped_setup
+
     batch_time_start = time.time()
 
     for epoch in range(start_epoch, config.num_epochs):
-        # Free GPU memory from previous epoch
-        torch.cuda.empty_cache()
+        # Free GPU memory periodically (not every epoch to avoid overhead)
+        if epoch % 5 == 0:
+            torch.cuda.empty_cache()
 
         # ── Eval & Checkpoint ────────────────────────────────────
         # [ACCEL PATCH 4] DDP-compatible checkpoint save (replaces save_fsdp_checkpoint)
@@ -645,16 +678,30 @@ def main(_):
             all_my_trajs.append({})
             all_my_images.append({})
 
+        god_vote_K = spy_cfg.get('god_vote_K', 8)
+        first_game_vote_texts = None
+        first_game_god_prompt = None
+        all_vote_count_tensors = torch.zeros(G, num_players,
+                                              device=accelerator.device, dtype=torch.long)
+        all_game_pils = {}
+        all_game_god_prompts = {}
+        all_vote_samples = {}
+        all_game_vote_infos = {}  # g -> list of K vote parse results (including None)
+
+        # ================================================================
+        # PHASE 1+2 PIPELINE: Generate + Vote per game (no cross-GPU wait)
+        # Each GPU generates all players for a game, then immediately votes.
+        # Voting uses LOCAL images (no all_reduce needed for voting).
+        # ================================================================
         with autocast():
             for g in my_game_ids_gen:
                 game_data = all_game_data_list[g]
                 spy_player = game_data['spy_player']
-                game_pil_images = []  # Accumulate PIL images for spy's context
+                game_pil_images = []
 
+                # ── Generate all players for this game ──
                 for pid in range(num_players):
-                    player_id = pid + 1  # 1-indexed
-
-                    # Only spy sees previous players' images; civilians get no context
+                    player_id = pid + 1
                     if player_id == spy_player:
                         prev_images = list(game_pil_images)
                     else:
@@ -673,7 +720,6 @@ def main(_):
                             cfg_text_scale=config.sample.guidance_scale,
                             **inference_hyper,
                         )
-                    # output_dict is a single item (the generated image dict)
                     result = output_dict[0] if isinstance(output_dict, list) else output_dict
 
                     all_my_trajs[g][pid] = {
@@ -684,58 +730,11 @@ def main(_):
                     }
                     all_my_images[g][pid] = result['image']
 
-                    # Convert to PIL and accumulate for next player's context
                     pil_img = tensor_images_to_pil(result['image'].unsqueeze(0).float())[0]
                     game_pil_images.append(pil_img)
 
-        # SINGLE all_reduce for ALL G games' images at once: [G, N, 3, H, W]
-        # Find image shape from any generated image
-        img_shape = None
-        for g in my_game_ids_gen:
-            img_shape = list(all_my_images[g][0].shape)
-            break
-        # Broadcast img_shape from rank that has it
-        if img_shape is None:
-            img_shape = [3, config.resolution, config.resolution]  # fallback
-        all_images_packed = torch.zeros(G, num_players, *img_shape,
-                                        device=accelerator.device, dtype=torch.bfloat16)
-        for g in my_game_ids_gen:
-            for pid in range(num_players):
-                all_images_packed[g, pid] = all_my_images[g][pid]
-        torch.distributed.all_reduce(all_images_packed, op=torch.distributed.ReduceOp.SUM)
-
-        t_gen_total = time.time() - t_gen_start
-
-        # ================================================================
-        # BATCHED PHASE 2: God-judge voting (Vision-Zero style)
-        # One unbiased God-judge votes K times per game. No player voting.
-        # Each GPU handles a subset of games. Single all_reduce at end.
-        # ================================================================
-        t_vote_start = time.time()
-        god_vote_K = spy_cfg.get('god_vote_K', 8)
-        first_game_vote_texts = None
-        first_game_god_prompt = None
-
-        # Each GPU handles a subset of games for voting
-        my_game_ids = [g for g in range(G) if g % n_gpus == rank]
-
-        # Collect vote_counts per game: {player_id: num_god_votes_received}
-        # Pack as [G, num_players] tensor (vote counts, not individual votes)
-        all_vote_count_tensors = torch.zeros(G, num_players,
-                                              device=accelerator.device, dtype=torch.long)
-
-        # Pre-compute PIL images and god prompts per game (reused in Phase 4)
-        all_game_pils = {}    # g -> list of N PIL images
-        all_game_god_prompts = {}  # g -> god prompt string
-        all_vote_samples = {}  # g -> list of K vote sample dicts (for decision backward)
-
-        with torch.no_grad():
-            for g in my_game_ids:
-                game_data = all_game_data_list[g]
-                player_images_g = [all_images_packed[g, pid] for pid in range(num_players)]
-
-                player_pils = tensor_images_to_pil(
-                    torch.stack(player_images_g).float())
+                # ── Immediately vote for this game (uses local images, no all_reduce needed) ──
+                player_pils = game_pil_images  # reuse PIL images from generation
                 all_game_pils[g] = player_pils
 
                 god_prompt = game_generator.format_voting_prompt(
@@ -743,39 +742,60 @@ def main(_):
                     god_sees_description=spy_cfg.get('god_sees_description', False))
                 all_game_god_prompts[g] = god_prompt
 
-                if decision_training:
-                    # Sample with log_probs — reused in decision backward (no duplicate)
-                    vote_samples = sample_vote_with_logprobs(
-                        inferencer, player_pils, god_prompt,
-                        num_generations=god_vote_K,
-                        max_tokens=max_vote_tokens,
-                        temperature=spy_cfg.get('decision_temperature', 0.7))
-                    all_vote_samples[g] = vote_samples
-                    vote_texts = [vs['text'] for vs in vote_samples]
-                else:
-                    vote_texts = run_bagel_vote_multi_image_repeated(
-                        inferencer, player_pils, god_prompt,
-                        num_generations=god_vote_K,
-                        max_tokens=max_vote_tokens,
-                    )
+                with torch.no_grad():
+                    if decision_training:
+                        vote_samples = sample_vote_with_logprobs(
+                            inferencer, player_pils, god_prompt,
+                            num_generations=god_vote_K,
+                            max_tokens=max_vote_tokens,
+                            temperature=spy_cfg.get('decision_temperature', 0.7))
+                        all_vote_samples[g] = vote_samples
+                        vote_texts = [vs['text'] for vs in vote_samples]
+                    else:
+                        vote_texts = run_bagel_vote_multi_image_repeated(
+                            inferencer, player_pils, god_prompt,
+                            num_generations=god_vote_K,
+                            max_tokens=max_vote_tokens,
+                            temperature=spy_cfg.get('decision_temperature', 0.9),
+                        )
 
-                # Count votes per player
+                # Parse votes and save raw results (including None for invalid)
+                game_vote_infos = []
                 for vtext in vote_texts:
                     vote_info = game_generator.extract_vote(vtext)
+                    game_vote_infos.append(vote_info)  # None if parse failed
                     if vote_info and isinstance(vote_info.get('voted_spy'), int):
                         voted_pid = vote_info['voted_spy']
                         if 1 <= voted_pid <= num_players:
                             all_vote_count_tensors[g, voted_pid - 1] += 1
+                all_game_vote_infos[g] = game_vote_infos
 
                 if g == 0 and rank == 0:
                     first_game_vote_texts = vote_texts
                     first_game_god_prompt = god_prompt
 
-        # SINGLE all_reduce: SUM vote counts across GPUs
-        # (each game is handled by exactly one GPU, others have 0)
+        # all_reduce vote_counts (always needed for reward)
         torch.distributed.all_reduce(all_vote_count_tensors, op=torch.distributed.ReduceOp.SUM)
 
-        t_vote_total = time.time() - t_vote_start
+        # all_reduce images — only needed for generation training backward
+        # (decision training only needs local images, already cached in all_game_pils)
+        img_shape = None
+        for g in my_game_ids_gen:
+            img_shape = list(all_my_images[g][0].shape)
+            break
+        if img_shape is None:
+            img_shape = [3, config.resolution, config.resolution]
+        all_images_packed = torch.zeros(G, num_players, *img_shape,
+                                        device=accelerator.device, dtype=torch.bfloat16)
+        for g in my_game_ids_gen:
+            for pid in range(num_players):
+                all_images_packed[g, pid] = all_my_images[g][pid]
+        if not decision_training or spy_cfg.get('phase_cycle_length', 10) < 100000:
+            # Only sync images if generation training is active or will be soon
+            torch.distributed.all_reduce(all_images_packed, op=torch.distributed.ReduceOp.SUM)
+
+        t_gen_total = time.time() - t_gen_start  # combined gen+vote time
+        t_vote_total = 0.0  # merged into gen phase
 
         # ================================================================
         # Phase 3: Compute rewards for all G games (CPU, fast)
@@ -800,13 +820,8 @@ def main(_):
                 "spy_player": spy_pid,
             }
 
-            # Also build game_votes list for vote statistics logging
-            # (expand vote_counts into a flat list of K individual votes for stats)
-            game_votes = []
-            for pid in range(num_players):
-                cnt = vote_counts[pid + 1]
-                for _ in range(cnt):
-                    game_votes.append({'voted_spy': pid + 1})
+            # Use raw vote parse results for statistics (includes None for invalid)
+            game_votes = all_game_vote_infos.get(g, [])
 
             gen_rewards = game_generator.compute_generation_rewards(
                 game_outcome,
@@ -939,39 +954,53 @@ def main(_):
         else:
             training_phase = 'generation'
 
-        # ── Training setup ────────────────────────────────────────
-        transformer.train()
-        unwrapped = accelerator.unwrap_model(transformer)
-        unwrapped.training = False
-        unwrapped.model.training = False
-        if config.use_lora:
-            unwrapped.model.model.training = False
-            for layer in unwrapped.model.model.layers:
-                layer.training = False
-                if hasattr(layer, 'self_attn'):
-                    layer.self_attn.training = False
-        else:
-            for layer in unwrapped.model.layers:
-                layer.training = False
-                if hasattr(layer, 'self_attn'):
-                    layer.self_attn.training = False
+        # Training mode already set before epoch loop (one-time setup)
 
-        # Pre-compute PIL images of previous players for each game (only spy sees them)
+        # Offload und_optimizer states to CPU during generation phase to prevent OOM.
+        # und_optimizer is a raw PyTorch optimizer (not Accelerator-wrapped), so we can
+        # freely move its states. This saves ~28GB during generation backward.
+        if decision_training and und_optimizer is not None:
+            device = accelerator.device
+            if training_phase == 'generation':
+                # Offload und_optimizer states + ref model to CPU (save ~42GB)
+                for state in und_optimizer.state.values():
+                    for k, v in state.items():
+                        if torch.is_tensor(v) and v.device.type != 'cpu':
+                            state[k] = v.cpu()
+                if hasattr(model, 'language_model_ref') and model.language_model_ref is not None:
+                    model.language_model_ref.cpu()
+                torch.cuda.empty_cache()
+                if accelerator.is_main_process:
+                    mem_gb = torch.cuda.memory_allocated() / 1024**3
+                    logger.info(f"  [OFFLOAD→CPU] und_opt + ref_model. GPU mem: {mem_gb:.1f}GB")
+            elif training_phase == 'decision':
+                # Restore und_optimizer states + ref model to GPU
+                for state in und_optimizer.state.values():
+                    for k, v in state.items():
+                        if torch.is_tensor(v) and v.device.type == 'cpu':
+                            state[k] = v.to(device)
+                if hasattr(model, 'language_model_ref') and model.language_model_ref is not None:
+                    model.language_model_ref.to(device)
+                if accelerator.is_main_process:
+                    mem_gb = torch.cuda.memory_allocated() / 1024**3
+                    logger.info(f"  [RESTORE→GPU] und_opt + ref_model. GPU mem: {mem_gb:.1f}GB")
+
+        # Pre-compute PIL images of previous players (only needed for generation backward)
         all_game_prev_pils = []
-        for g in range(G):
-            spy_player = all_game_data_list[g]['spy_player']
-            game_prev_pils = []
-            accumulated_pils = []
-            for pid in range(num_players):
-                player_id = pid + 1
-                # Only spy gets previous images; civilians get empty list
-                if player_id == spy_player:
-                    game_prev_pils.append(list(accumulated_pils))
-                else:
-                    game_prev_pils.append([])
-                pil_img = tensor_images_to_pil(all_images_packed[g, pid].unsqueeze(0).float())[0]
-                accumulated_pils.append(pil_img)
-            all_game_prev_pils.append(game_prev_pils)
+        if training_phase == 'generation':
+            for g in range(G):
+                spy_player = all_game_data_list[g]['spy_player']
+                game_prev_pils = []
+                accumulated_pils = []
+                for pid in range(num_players):
+                    player_id = pid + 1
+                    if player_id == spy_player:
+                        game_prev_pils.append(list(accumulated_pils))
+                    else:
+                        game_prev_pils.append([])
+                    pil_img = tensor_images_to_pil(all_images_packed[g, pid].unsqueeze(0).float())[0]
+                    accumulated_pils.append(pil_img)
+                all_game_prev_pils.append(game_prev_pils)
 
         # Restore wrapped model for training backward
         model.language_model = wrapped_lm_save
@@ -994,9 +1023,6 @@ def main(_):
 
             if training_phase == 'generation':
                 # ── Generation GRPO backward (moe_gen params) ──
-                # generate_image_learn() internally handles:
-                #   accumulate(transformer) → forward → backward → optimizer.step/zero_grad
-                # Accelerator manages gradient accumulation and DDP sync automatically.
                 adv_idx = 0
                 for g in range(G):
                     for pid in range(num_players):
@@ -1058,7 +1084,7 @@ def main(_):
 
             elif training_phase == 'decision' and und_optimizer is not None:
                 # ── Decision GRPO backward (und params) ──
-                torch.cuda.empty_cache()
+                # (und_optimizer states already restored to GPU in offload block above)
 
                 # Freeze moe_gen params during decision phase
                 for n, p in accelerator.unwrap_model(transformer).named_parameters():
@@ -1111,7 +1137,6 @@ def main(_):
                             info["decision_kl"].append(
                                 torch.tensor(loss_info['text_kl_mean']))
                         del loss
-                        torch.cuda.empty_cache()
 
                 # Restore: unfreeze moe_gen, restore wrapped model
                 for n, p in accelerator.unwrap_model(transformer).named_parameters():
@@ -1129,6 +1154,8 @@ def main(_):
                     config.train.max_grad_norm or 1.0)
                 und_optimizer.step()
                 und_optimizer.zero_grad()
+                if und_scheduler is not None:
+                    und_scheduler.step()
                 gen_optimizer.zero_grad()  # Clear any stray gen grads
 
             if info and accelerator.is_main_process:

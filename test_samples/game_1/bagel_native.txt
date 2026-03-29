@@ -1,0 +1,22 @@
+=== Native Bagel Understanding (no game framing) ===
+
+Prompt: Compare these 4 images carefully. They are supposed to show the same 3D scene with geometric objects. Which image looks different from the others? Describe the differences you see.
+
+Response (8.2s):
+The differences between the images are as follows:
+
+1. The first image shows a large, light blue cylinder in the center foreground with a green cube in the background to the left, a red sphere to the right, and a blue sphere behind the red sphere in the upper right.
+
+2. The second image has the same objects as the first but with the objects' positions slightly changed. The large light blue cylinder is now slightly tilted, the green cube is still to the left, but the red and blue spheres have been moved closer together.
+
+3. The third image introduces a beige cube to the left of the large light blue cylinder, which is unchanged from the previous images. The spheres are in the same positions as in the second image.
+
+4. The fourth image shows the large light blue cylinder in the same position as in the first image, but the background has been changed to a solid light blue color. The green, red, and blue spheres are in the same positions as in the second image.
+
+The differences in the fourth image are the change in the background color to light blue and the addition of the beige cube.
+
+--- Detailed analysis prompt ---
+Prompt: These 4 images show 3D rendered scenes. One image is slightly different. Which one and why? Please think step by step.
+
+Response (1.9s):
+The third image is different. In the first image, there is a green cube in the background. In the second image, the green cube has been replaced with a green cylinder. In the fourth image, the green cube has been removed entirely.
