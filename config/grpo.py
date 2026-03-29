@@ -1036,14 +1036,14 @@ def spy_game_bagel():
     config.sample.eval_guidance_scale = 4.0
     config.sample.same_latent = False
     config.sample.noise_level = 1.0
-    config.sample.sde_window_size = 4
+    config.sample.sde_window_size = 3
     config.sample.sde_window_range = (0, config.sample.num_steps // 2)
 
     # Training
     config.train.num_inner_epochs = 2
     config.train.clip_range_lt = 1e-5       # flow_grpo bagel default (diffusion SDE ratio clipping)
     config.train.clip_range_gt = 1e-5       # flow_grpo bagel default (diffusion SDE ratio clipping)
-    config.train.beta = 0                   # KL penalty disabled (needs ref model init; TODO)
+    config.train.beta = 0.04                 # KL penalty for generation (Vision-Zero: 0.04)
     config.train.learning_rate = 1e-4       # flow_grpo bagel default
     config.train.cfg = True
     config.train.ema = False
@@ -1062,14 +1062,25 @@ def spy_game_bagel():
     config.spy_game.use_role_advantage = True   # Vision-Zero style role advantage (EMA baseline)
     config.spy_game.reward_beta = 0.1      # Camp shared potential coefficient (Vision-Zero)
     config.spy_game.reward_lambda = 0.1    # Individual suspicion penalty coefficient (Vision-Zero)
-    config.spy_game.god_vote_K = 8         # Number of God-judge votes per game (Vision-Zero style)
+    config.spy_game.god_vote_K = 8         # Number of God-judge votes per game (Vision-Zero: 8)
     config.spy_game.god_sees_description = False  # If True, God judge sees original CIV description as reference
+
+    # Decision phase (VLM GRPO) — params from Vision-Zero run_grpo_vision_zero.sh
+    config.spy_game.decision_training = False     # Enable decision phase training
+    config.spy_game.phase_cycle_length = 10       # Switch phase every N steps
+    config.spy_game.decision_lr = 1e-5            # VLM learning rate (Vision-Zero: 1e-5)
+    config.spy_game.decision_clip_range = 0.2     # PPO epsilon (Vision-Zero: 0.2)
+    config.spy_game.decision_kl_beta = 0.04       # KL coefficient (Vision-Zero: 0.04)
+    config.spy_game.decision_temperature = 0.7    # Voting sampling temperature
+    config.spy_game.decision_weight_decay = 0.01  # AdamW weight decay (Vision-Zero: 0.01)
+    config.spy_game.decision_lambda_fmt = 0.3     # Format reward weight
+    config.spy_game.decision_beta_acc = 1.2       # Accuracy reward weight
 
     config.activation_checkpointing = True
 
     config.logdir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs'
-    config.save_freq = 30
-    config.eval_freq = 30
+    config.save_freq = 100
+    config.eval_freq = 100
     config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel'
     config.num_epochs = 100000
 
@@ -1108,11 +1119,13 @@ def spy_game_bagel_geneval():
 def spy_game_bagel_pickscore():
     """Bagel training with spy-civ self-play on pickscore natural scene data."""
     config = spy_game_bagel()
-    config.run_name = "[bagel-spy-pickscore-god-desc]-4gpu"
+    config.run_name = "[bagel-spy-pickscore-decision]-4gpu"
     config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/pickscore_sfw"
     config.spy_game.prompt_type = "pickscore"
-    config.spy_game.god_sees_description = True  # God judge sees original CIV description
-    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore_god_desc'
+    config.spy_game.god_sees_description = True
+    config.spy_game.decision_training = True
+    config.spy_game.phase_cycle_length = 100000  # Only decision phase (never switch to gen)
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_pickscore_decision'
     return config
 
 

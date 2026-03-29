@@ -45,6 +45,8 @@ from flow_grpo.spy_game_data import SpyGameDataGenerator, TextFileGameDataGenera
 from flow_grpo.spy_game_reward import (
     build_voting_grid, tensor_images_to_pil,
     run_bagel_vote_multi_image_repeated, compute_group_advantages,
+    sample_vote_with_logprobs, compute_decision_rewards,
+    compute_text_grpo_loss, build_vote_kv_cache,
 )
 
 import numpy as np
@@ -53,7 +55,6 @@ import torch.nn.functional as F
 import wandb
 
 import tempfile
-from PIL import Image
 from peft import LoraConfig, get_peft_model
 from huggingface_hub import snapshot_download
 from concurrent.futures import ThreadPoolExecutor
@@ -92,6 +93,10 @@ def _async_log_metrics(all_game_images_t, all_game_data_list, all_game_rewards,
         "ema_baseline_gap": game_generator.b_civ - game_generator.b_spy,
         "use_role_advantage": float(use_role_advantage),
     }
+    # Spy position distribution
+    spy_positions = [gd['spy_player'] for gd in all_game_data_list]
+    for pid in range(1, num_players + 1):
+        game_metrics[f"spy_at_player_{pid}"] = sum(1 for s in spy_positions if s == pid) / max(len(spy_positions), 1)
     if use_role_advantage:
         game_metrics["mean_adjusted_reward"] = np.mean(flat_rewards)
         game_metrics["adjusted_reward_std"] = np.std(flat_rewards)
@@ -322,13 +327,12 @@ def main(_):
     G = spy_cfg.group_size
     num_inner_epochs = config.train.num_inner_epochs
 
-    # NOTE: gradient_accumulation_steps is set here for Accelerator init but is
-    # overridden to 999999 during training (see [ACCEL PATCH 2] below).
-    # Actual gradient sync is done manually via no_sync + all_reduce.
+    # gradient_accumulation_steps is set to 1 here; overridden per-epoch in
+    # training loop to match (games_per_rank * num_players * sde_window).
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
-        gradient_accumulation_steps=1,  # placeholder; overridden by manual sync
+        gradient_accumulation_steps=1,
     )
     if hasattr(accelerator.state, 'fsdp_plugin') and accelerator.state.fsdp_plugin is not None:
         accelerator.state.fsdp_plugin.activation_checkpointing = config.activation_checkpointing
@@ -416,6 +420,16 @@ def main(_):
     model = model.eval()
     torch.cuda.empty_cache()
 
+    # Create frozen reference model for KL penalty (if beta > 0)
+    if config.train.beta > 0:
+        language_model_ref = Qwen2ForCausalLM(llm_config)
+        language_model_ref.load_state_dict(model.language_model.state_dict())
+        language_model_ref.to(device=f"cuda:{accelerator.local_process_index}", dtype=inference_dtype)
+        language_model_ref.eval()
+        language_model_ref.requires_grad_(False)
+        model.language_model_ref = language_model_ref
+        logger.info("  KL reference model: CREATED (frozen copy of language_model)")
+
     vae_model.requires_grad_(False)
     model.requires_grad_(False)
 
@@ -454,27 +468,56 @@ def main(_):
         for name, param in model.language_model.named_parameters():
             if 'moe_gen' in name:
                 param.requires_grad = True
+        # Enable und params for decision phase training
+        decision_training = spy_cfg.get('decision_training', False)
+        if decision_training:
+            # Enable all und params (non-moe_gen) for decision phase training
+            for name, param in model.language_model.named_parameters():
+                if 'moe_gen' not in name and 'embed_tokens' not in name and 'lm_head' not in name:
+                    param.requires_grad = True
 
     transformer = model.language_model
     transformer.config.use_cache = False
-    transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
 
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    optimizer = torch.optim.AdamW(
-        transformer_trainable_parameters,
+    # Dual optimizers: gen (diffusion GRPO) + und (VLM GRPO)
+    gen_params = [p for n, p in transformer.named_parameters()
+                  if 'moe_gen' in n and p.requires_grad]
+    gen_optimizer = torch.optim.AdamW(
+        gen_params,
         lr=config.train.learning_rate,
         betas=(config.train.adam_beta1, config.train.adam_beta2),
         weight_decay=config.train.adam_weight_decay,
         eps=config.train.adam_epsilon,
     )
 
+    decision_training = spy_cfg.get('decision_training', False)
+    if decision_training:
+        und_params = [p for n, p in transformer.named_parameters()
+                      if 'moe_gen' not in n and p.requires_grad]
+        und_optimizer = torch.optim.AdamW(
+            und_params,
+            lr=spy_cfg.get('decision_lr', 1e-5),
+            betas=(0.9, 0.999),
+            weight_decay=spy_cfg.get('decision_weight_decay', 0.01),
+            eps=1e-8,
+        )
+        logger.info(f"  Decision training: ENABLED (und params: {len(und_params)}, "
+                     f"lr={spy_cfg.get('decision_lr', 1e-5)})")
+    else:
+        und_optimizer = None
+
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
 
-    transformer, optimizer = accelerator.prepare(transformer, optimizer)
+    if decision_training:
+        transformer, gen_optimizer, und_optimizer = accelerator.prepare(
+            transformer, gen_optimizer, und_optimizer)
+    else:
+        transformer, gen_optimizer = accelerator.prepare(transformer, gen_optimizer)
     model.language_model = transformer
 
     # ==================== GAME SETUP ====================
@@ -507,7 +550,7 @@ def main(_):
     logger.info(f"  SDE window={config.sample.sde_window_size}")
     games_per_rank = _math.ceil(G / n_gpus)
     logger.info(f"  GPUs={n_gpus}, games_per_rank={games_per_rank} (sequential gen per game)")
-    logger.info(f"  Gradient sync: manual no_sync + all_reduce AVG")
+    logger.info(f"  Gradient sync: Accelerator accumulate() (gen) / manual all_reduce (decision)")
     logger.info(f"  Backward calls per rank per inner epoch: "
                 f"{games_per_rank}(games/rank) x {num_players}(players) x {config.sample.sde_window_size}(sde) "
                 f"= {games_per_rank * num_players * config.sample.sde_window_size}")
@@ -605,14 +648,20 @@ def main(_):
         with autocast():
             for g in my_game_ids_gen:
                 game_data = all_game_data_list[g]
-                game_pil_images = []  # Accumulate PIL images for previous players
+                spy_player = game_data['spy_player']
+                game_pil_images = []  # Accumulate PIL images for spy's context
 
                 for pid in range(num_players):
                     player_id = pid + 1  # 1-indexed
 
-                    # Build interleaved input: [prev_label, prev_img, ..., prompt]
+                    # Only spy sees previous players' images; civilians get no context
+                    if player_id == spy_player:
+                        prev_images = list(game_pil_images)
+                    else:
+                        prev_images = []
+
                     input_list = game_generator.build_generation_input_list(
-                        game_data, player_id, game_pil_images)
+                        game_data, player_id, prev_images)
 
                     with torch.no_grad():
                         output_dict = inferencer.interleave_inference(
@@ -664,6 +713,8 @@ def main(_):
         # ================================================================
         t_vote_start = time.time()
         god_vote_K = spy_cfg.get('god_vote_K', 8)
+        first_game_vote_texts = None
+        first_game_god_prompt = None
 
         # Each GPU handles a subset of games for voting
         my_game_ids = [g for g in range(G) if g % n_gpus == rank]
@@ -673,26 +724,40 @@ def main(_):
         all_vote_count_tensors = torch.zeros(G, num_players,
                                               device=accelerator.device, dtype=torch.long)
 
+        # Pre-compute PIL images and god prompts per game (reused in Phase 4)
+        all_game_pils = {}    # g -> list of N PIL images
+        all_game_god_prompts = {}  # g -> god prompt string
+        all_vote_samples = {}  # g -> list of K vote sample dicts (for decision backward)
+
         with torch.no_grad():
             for g in my_game_ids:
                 game_data = all_game_data_list[g]
                 player_images_g = [all_images_packed[g, pid] for pid in range(num_players)]
 
-                # Convert individual player image tensors to PIL for VLM voting
                 player_pils = tensor_images_to_pil(
                     torch.stack(player_images_g).float())
+                all_game_pils[g] = player_pils
 
-                # God-judge prompt (player_id=None → unbiased perspective)
                 god_prompt = game_generator.format_voting_prompt(
                     game_data, player_id=None,
                     god_sees_description=spy_cfg.get('god_sees_description', False))
+                all_game_god_prompts[g] = god_prompt
 
-                # K repeated votes with cached ViT encoding (encode images once)
-                vote_texts = run_bagel_vote_multi_image_repeated(
-                    inferencer, player_pils, god_prompt,
-                    num_generations=god_vote_K,
-                    max_tokens=max_vote_tokens,
-                )
+                if decision_training:
+                    # Sample with log_probs — reused in decision backward (no duplicate)
+                    vote_samples = sample_vote_with_logprobs(
+                        inferencer, player_pils, god_prompt,
+                        num_generations=god_vote_K,
+                        max_tokens=max_vote_tokens,
+                        temperature=spy_cfg.get('decision_temperature', 0.7))
+                    all_vote_samples[g] = vote_samples
+                    vote_texts = [vs['text'] for vs in vote_samples]
+                else:
+                    vote_texts = run_bagel_vote_multi_image_repeated(
+                        inferencer, player_pils, god_prompt,
+                        num_generations=god_vote_K,
+                        max_tokens=max_vote_tokens,
+                    )
 
                 # Count votes per player
                 for vtext in vote_texts:
@@ -701,6 +766,10 @@ def main(_):
                         voted_pid = vote_info['voted_spy']
                         if 1 <= voted_pid <= num_players:
                             all_vote_count_tensors[g, voted_pid - 1] += 1
+
+                if g == 0 and rank == 0:
+                    first_game_vote_texts = vote_texts
+                    first_game_god_prompt = god_prompt
 
         # SINGLE all_reduce: SUM vote counts across GPUs
         # (each game is handled by exactly one GPU, others have 0)
@@ -721,7 +790,9 @@ def main(_):
 
             # Build game_outcome compatible with compute_generation_rewards
             spy_pid = game_data['spy_player']
-            spy_caught = vote_counts[spy_pid] == max(vote_counts.values())
+            max_votes = max(vote_counts.values())
+            spy_caught = (vote_counts[spy_pid] == max_votes and
+                          sum(1 for v in vote_counts.values() if v == max_votes) == 1)
             game_outcome = {
                 "player_rewards": {pid + 1: 0.0 for pid in range(num_players)},
                 "spy_caught": spy_caught,
@@ -810,7 +881,65 @@ def main(_):
                 batch_time, epoch, global_step, config,
             )
 
-        # ── Training: per-player per-SDE-step backward ───────────
+            # Log full vote texts for first game (every 10 epochs)
+            if epoch % 5 == 0 and first_game_vote_texts is not None:
+                try:
+                    gd = all_game_data_list[0]
+                    spy_pid = gd['spy_player']
+                    # Vote counts for this game
+                    vc = {pid+1: all_vote_count_tensors[0, pid].item() for pid in range(num_players)}
+
+                    vote_log = f"<h3>Epoch {epoch} | Game 0 | Spy=Player {spy_pid}</h3>\n"
+                    vote_log += f"<b>Original prompt (CIV):</b> {gd['original_description']}<br>\n"
+                    vote_log += f"<b>Modified prompt (SPY):</b> {gd['modified_description']}<br>\n"
+                    vote_log += f"<b>Change:</b> {gd['diff_metadata'].get('change', '?')}<br>\n"
+                    max_vc = max(vc.values()) if vc else 0
+                    spy_caught_log = (vc.get(spy_pid, 0) == max_vc and
+                                      sum(1 for v in vc.values() if v == max_vc) == 1)
+                    vote_log += f"<b>Vote counts:</b> {vc} | Spy caught: {spy_caught_log}<br>\n"
+                    vote_log += f"<b>God prompt:</b><br><pre>{first_game_god_prompt}</pre><hr>\n"
+
+                    import re as _re_log
+                    n_valid = 0; n_correct = 0; n_na = 0; n_invalid = 0; n_has_think = 0
+                    for vi, vt in enumerate(first_game_vote_texts):
+                        vote_info = game_generator.extract_vote(vt)
+                        voted = vote_info.get('voted_spy', '?') if vote_info else 'PARSE_FAIL'
+                        # Stats
+                        if vote_info is None:
+                            n_invalid += 1
+                        elif voted == 'N/A':
+                            n_na += 1; n_valid += 1
+                        elif isinstance(voted, int):
+                            n_valid += 1
+                            if voted == spy_pid:
+                                n_correct += 1
+                        think_m = _re_log.search(r'<think>(.*?)</think>', vt, _re_log.DOTALL)
+                        if think_m and len(think_m.group(1).strip()) > 10:
+                            n_has_think += 1
+
+                        correct = "✓" if voted == spy_pid else ("N/A" if voted == "N/A" else "✗")
+                        vote_log += f"<h4>Vote {vi+1}/{len(first_game_vote_texts)}: "
+                        vote_log += f"voted=Player {voted} {correct}</h4>\n"
+                        vote_log += f"<pre>{vt}</pre><hr>\n"
+
+                    vote_log += (f"<b>Summary:</b> valid={n_valid}, correct={n_correct}, "
+                                 f"N/A={n_na}, invalid={n_invalid}, has_think={n_has_think}<br>\n")
+
+                    wandb.log({"vote_texts": wandb.Html(vote_log)}, step=global_step)
+                except Exception:
+                    pass
+
+        # ── Determine training phase ──────────────────────────────
+        if decision_training:
+            cycle_length = spy_cfg.get('phase_cycle_length', 10)
+            total_cycle = cycle_length * 2
+            cycle_pos = global_step % total_cycle
+            # Decision first, then generation
+            training_phase = 'decision' if cycle_pos < cycle_length else 'generation'
+        else:
+            training_phase = 'generation'
+
+        # ── Training setup ────────────────────────────────────────
         transformer.train()
         unwrapped = accelerator.unwrap_model(transformer)
         unwrapped.training = False
@@ -827,14 +956,19 @@ def main(_):
                 if hasattr(layer, 'self_attn'):
                     layer.self_attn.training = False
 
-        # Pre-compute PIL images of previous players for each game (for training context)
-        # all_images_packed is [G, N, 3, H, W] — convert to PIL per game per player
-        all_game_prev_pils = []  # [G][N] list of lists: prev_pils[g][pid] = list of PIL for players 0..pid-1
+        # Pre-compute PIL images of previous players for each game (only spy sees them)
+        all_game_prev_pils = []
         for g in range(G):
+            spy_player = all_game_data_list[g]['spy_player']
             game_prev_pils = []
             accumulated_pils = []
             for pid in range(num_players):
-                game_prev_pils.append(list(accumulated_pils))  # copy current list
+                player_id = pid + 1
+                # Only spy gets previous images; civilians get empty list
+                if player_id == spy_player:
+                    game_prev_pils.append(list(accumulated_pils))
+                else:
+                    game_prev_pils.append([])
                 pil_img = tensor_images_to_pil(all_images_packed[g, pid].unsqueeze(0).float())[0]
                 accumulated_pils.append(pil_img)
             all_game_prev_pils.append(game_prev_pils)
@@ -845,20 +979,25 @@ def main(_):
         rank = accelerator.process_index
         n_gpus = accelerator.num_processes
 
-        # ── [ACCEL PATCH 2] Training with deferred gradient sync ──
-        saved_grad_accum = accelerator.gradient_accumulation_steps
-        accelerator.gradient_accumulation_steps = 999999
+        # Set gradient_accumulation_steps so Accelerator's accumulate() mechanism
+        # inside generate_image_learn() works correctly.
+        # generate_image_learn() calls accumulate(transformer) + optimizer.step() for each SDE step.
+        # Accumulate counts up and only does a real step() every GA steps.
+        # We want 1 real optimizer step per (games_per_rank * num_players * sde_window) backward calls.
+        games_per_rank = len([g for g in range(G) if g % n_gpus == rank])
+        accelerator.gradient_accumulation_steps = games_per_rank * num_players * config.sample.sde_window_size
 
-        no_sync_ctx = transformer.no_sync if hasattr(transformer, 'no_sync') else contextlib.nullcontext
         info = defaultdict(list)
-
-        # Training: per-game parallelism (same as generation phase)
         my_game_ids_train = set(g for g in range(G) if g % n_gpus == rank)
 
         for inner_epoch in range(num_inner_epochs):
-            adv_idx = 0
 
-            with no_sync_ctx():
+            if training_phase == 'generation':
+                # ── Generation GRPO backward (moe_gen params) ──
+                # generate_image_learn() internally handles:
+                #   accumulate(transformer) → forward → backward → optimizer.step/zero_grad
+                # Accelerator manages gradient accumulation and DDP sync automatically.
+                adv_idx = 0
                 for g in range(G):
                     for pid in range(num_players):
                         has_traj = (g in my_game_ids_train) and ('all_latents' in all_game_trajs[g][pid])
@@ -884,7 +1023,6 @@ def main(_):
                                 timesteps[-1:],
                             ])
 
-                            # Build interleaved input with previous players' images
                             prev_pils = all_game_prev_pils[g][pid]
                             input_list = game_generator.build_generation_input_list(
                                 all_game_data_list[g], pid + 1, prev_pils)
@@ -897,13 +1035,12 @@ def main(_):
                                     sample=cur_sample,
                                     grpo_config=config,
                                     accelerator=accelerator,
-                                    optimizer=optimizer,
+                                    optimizer=gen_optimizer,
                                     transformer=transformer,
                                     num_timesteps=config.sample.num_steps,
                                     cfg_text_scale=config.sample.guidance_scale,
                                     **inference_hyper,
                                 )
-                            # interleave_inference returns a list
                             result = output_dict[0] if isinstance(output_dict, list) else output_dict
 
                             info["clipfrac"].append(result["clipfrac"])
@@ -913,32 +1050,99 @@ def main(_):
                             info["kl_loss"].append(result["kl_loss"])
                             info["loss"].append(result["loss"])
 
+                            # Check if accelerator performed an actual optimizer step
+                            if accelerator.sync_gradients:
+                                pass  # Gradients were synced and optimizer stepped
+
                         adv_idx += 1
 
-            # ── ONE gradient sync + optimizer step per inner epoch ──
-            if n_gpus > 1:
-                for param in transformer.parameters():
-                    if param.grad is not None:
-                        torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
+            elif training_phase == 'decision' and und_optimizer is not None:
+                # ── Decision GRPO backward (und params) ──
+                torch.cuda.empty_cache()
 
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in transformer.parameters() if p.grad is not None],
-                config.train.max_grad_norm or 1.0,
-            )
-            optimizer.step()
-            optimizer.zero_grad()
+                # Freeze moe_gen params during decision phase
+                for n, p in accelerator.unwrap_model(transformer).named_parameters():
+                    if 'moe_gen' in n:
+                        p.requires_grad = False
 
-            if info["loss"] and accelerator.is_main_process:
-                log_info = {k: torch.mean(torch.stack(v)).item()
-                            for k, v in info.items()}
-                log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
-                log_info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                # Unwrap model for sampling + backward
+                model.language_model = accelerator.unwrap_model(transformer)
+
+                for g in range(G):
+                    if g not in my_game_ids_train:
+                        continue
+                    if g not in all_vote_samples:
+                        continue
+                    game_data = all_game_data_list[g]
+                    spy_pid = game_data['spy_player']
+
+                    # Reuse cached PIL images and god prompt from Phase 2
+                    player_pils = all_game_pils[g]
+                    god_prompt = all_game_god_prompts[g]
+                    vote_samples = all_vote_samples[g]
+
+                    # Compute decision rewards (per-game group normalization)
+                    dec_rewards = compute_decision_rewards(
+                        vote_samples, spy_pid, num_players,
+                        game_generator.extract_vote,
+                        lambda_fmt=spy_cfg.get('decision_lambda_fmt', 0.3),
+                        beta_acc=spy_cfg.get('decision_beta_acc', 1.2))
+                    dec_advantages = compute_group_advantages(dec_rewards)
+
+                    # Build KV cache ONCE per game (images + prompt encoding)
+                    cached_kv = build_vote_kv_cache(
+                        model, inferencer.tokenizer, inferencer.new_token_ids,
+                        player_pils, god_prompt)
+
+                    # Text GRPO backward for each vote sample (reusing cached KV)
+                    for k, vs in enumerate(vote_samples):
+                        loss, loss_info = compute_text_grpo_loss(
+                            model, inferencer.tokenizer, inferencer.new_token_ids,
+                            inferencer, player_pils, god_prompt, vs,
+                            advantage=dec_advantages[k].item(),
+                            clip_range=spy_cfg.get('decision_clip_range', 0.2),
+                            kl_beta=spy_cfg.get('decision_kl_beta', 0.04),
+                            cached_kv=cached_kv)
+                        accelerator.backward(loss)
+                        info["decision_loss"].append(loss.detach())
+                        info["decision_clipfrac"].append(
+                            torch.tensor(loss_info['text_clipfrac']))
+                        if loss_info.get('text_kl_mean', 0) > 0:
+                            info["decision_kl"].append(
+                                torch.tensor(loss_info['text_kl_mean']))
+                        del loss
+                        torch.cuda.empty_cache()
+
+                # Restore: unfreeze moe_gen, restore wrapped model
+                for n, p in accelerator.unwrap_model(transformer).named_parameters():
+                    if 'moe_gen' in n:
+                        p.requires_grad = True
+                model.language_model = wrapped_lm_save
+
+                # Gradient sync + und_optimizer step
+                if n_gpus > 1:
+                    for param in transformer.parameters():
+                        if param.grad is not None:
+                            torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in transformer.parameters() if p.grad is not None],
+                    config.train.max_grad_norm or 1.0)
+                und_optimizer.step()
+                und_optimizer.zero_grad()
+                gen_optimizer.zero_grad()  # Clear any stray gen grads
+
+            if info and accelerator.is_main_process:
+                log_info = {}
+                for k, v in info.items():
+                    if v:
+                        log_info[k] = torch.mean(torch.stack(v)).item()
+                if "policy_loss" in log_info:
+                    log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
+                log_info.update({"epoch": epoch, "inner_epoch": inner_epoch,
+                                 "training_phase": 0 if training_phase == 'generation' else 1})
                 wandb.log(log_info, step=global_step)
             global_step += 1
             info = defaultdict(list)
-
-        # Restore original grad_accum
-        accelerator.gradient_accumulation_steps = saved_grad_accum
 
     if accelerator.is_main_process:
         wandb.finish()
