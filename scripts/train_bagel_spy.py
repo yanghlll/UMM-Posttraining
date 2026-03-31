@@ -11,11 +11,13 @@ Based on:
   - flow_grpo/scripts/train_bagel.py (model loading, FSDP, inferencer)
   - SPY-UMM/train_spy_umm.py (game loop structure)
 
-Architecture: b7a190a (cross-GPU player parallelism) + acceleration patches:
+Architecture: FSDP SHARD_GRAD_OP (ZeRO-2: gradient + optimizer states sharded) + patches:
+  - SHARD_GRAD_OP keeps full params on each GPU (no all-gather during forward),
+    so asymmetric inference (spy sees prev images, early EOS exit) works correctly.
+  - Gradients reduce-scattered only at accumulation boundary (once per epoch).
   - Remove accelerate dispatch hooks (10x voting speedup)
-  - Deferred gradient sync (DDP ~12s → <1s)
   - Async logging (non-blocking)
-  - DDP-compatible checkpoint save
+  - FSDP checkpoint save (full state dict, rank 0 only)
 """
 
 from collections import defaultdict
@@ -45,13 +47,15 @@ from flow_grpo.spy_game_data import SpyGameDataGenerator, TextFileGameDataGenera
 from flow_grpo.spy_game_reward import (
     build_voting_grid, tensor_images_to_pil,
     run_bagel_vote_multi_image_repeated, compute_group_advantages,
-    sample_vote_with_logprobs, compute_decision_rewards,
+    sample_vote_with_logprobs, batch_sample_vote_with_logprobs,
+    compute_decision_rewards,
     compute_text_grpo_loss, build_vote_kv_cache,
 )
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import wandb
 
 import tempfile
@@ -74,15 +78,10 @@ def _async_log_metrics(all_game_images_t, all_game_data_list, all_game_rewards,
 
     reward_metrics = {
         "epoch": epoch,
-        "mean_reward": np.mean(flat_rewards_raw),
         "reward_std": np.std(flat_rewards_raw),
-        "reward_min": np.min(flat_rewards_raw),
-        "reward_max": np.max(flat_rewards_raw),
         "spy_mean_reward": np.mean(epoch_spy_rewards) if epoch_spy_rewards else 0,
         "civ_mean_reward": np.mean(epoch_civ_rewards) if epoch_civ_rewards else 0,
-        "advantage_mean": float(advantages.mean()),
         "advantage_std": float(advantages.std()),
-        "advantage_abs_max": float(advantages.abs().max()),
     }
 
     game_metrics = {
@@ -91,15 +90,9 @@ def _async_log_metrics(all_game_images_t, all_game_data_list, all_game_rewards,
         "ema_baseline_spy": game_generator.b_spy,
         "ema_baseline_civ": game_generator.b_civ,
         "ema_baseline_gap": game_generator.b_civ - game_generator.b_spy,
-        "use_role_advantage": float(use_role_advantage),
     }
-    # Spy position distribution
-    spy_positions = [gd['spy_player'] for gd in all_game_data_list]
-    for pid in range(1, num_players + 1):
-        game_metrics[f"spy_at_player_{pid}"] = sum(1 for s in spy_positions if s == pid) / max(len(spy_positions), 1)
     if use_role_advantage:
         game_metrics["mean_adjusted_reward"] = np.mean(flat_rewards)
-        game_metrics["adjusted_reward_std"] = np.std(flat_rewards)
 
     vote_stats = compute_vote_statistics(all_game_votes, all_game_data_list)
 
@@ -123,19 +116,9 @@ def _async_log_metrics(all_game_images_t, all_game_data_list, all_game_rewards,
     except Exception:
         pass
 
-    timing_metrics = {
-        "batch_time": batch_time,
-        "games_per_sec": G / max(batch_time, 0.01),
-        "time_generation": t_gen_total,
-        "time_voting": t_vote_total,
-        "time_other": batch_time - t_gen_total - t_vote_total,
-        "pct_generation": t_gen_total / max(batch_time, 0.01) * 100,
-        "pct_voting": t_vote_total / max(batch_time, 0.01) * 100,
-    }
-
     all_metrics = {
         **reward_metrics, **game_metrics, **vote_stats,
-        **diversity_metrics, **spy_div_metrics, **timing_metrics,
+        **diversity_metrics, **spy_div_metrics,
     }
     wandb.log(all_metrics, step=global_step)
 
@@ -223,7 +206,6 @@ def compute_image_diversity_metrics(player_images_tensor: list) -> dict:
         "img_pairwise_mse": float(r[0]),
         "img_pixel_std": float(r[1]),
         "img_cosine_sim": float(r[2]),
-        "img_hist_sim": float(r[3]),
     }
 
 
@@ -265,7 +247,6 @@ def compute_spy_vs_civ_divergence(player_images_tensor: list,
     return {
         "spy_vs_civ_mse": float(r[0]),
         "civ_vs_civ_mse": float(r[1]),
-        "spy_civ_mse_ratio": float(r[2]),
         "spy_vs_civ_cosine": float(r[3]),
     }
 
@@ -307,6 +288,135 @@ config_flags.DEFINE_config_file("config", "config/base.py", "Training configurat
 logger = get_logger(__name__)
 
 
+def _log_grad_diagnostics(transformer, accelerator, phase, global_step, logger):
+    """Log gradient and parameter update diagnostics for both training phases.
+
+    Checks:
+      - generation phase: moe_gen params have grads, und params do NOT
+      - decision phase:   und params have grads, moe_gen params do NOT (zeroed)
+      - parameters actually changed (non-zero grad norm)
+    """
+    if not accelerator.is_main_process:
+        return
+    unwrapped = accelerator.unwrap_model(transformer)
+    gen_grad_norm = 0.0
+    gen_grad_count = 0
+    und_grad_norm = 0.0
+    und_grad_count = 0
+    gen_has_nonzero = False
+    und_has_nonzero = False
+    for n, p in unwrapped.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.grad is not None:
+            gn = p.grad.float().norm().item()
+            if 'moe_gen' in n:
+                gen_grad_norm += gn ** 2
+                gen_grad_count += 1
+                if gn > 1e-10:
+                    gen_has_nonzero = True
+            else:
+                und_grad_norm += gn ** 2
+                und_grad_count += 1
+                if gn > 1e-10:
+                    und_has_nonzero = True
+    gen_grad_norm = gen_grad_norm ** 0.5
+    und_grad_norm = und_grad_norm ** 0.5
+
+    if phase == 'generation':
+        ok = gen_has_nonzero and not und_has_nonzero
+        logger.info(
+            f"[Grad Check step={global_step}] phase={phase} | "
+            f"moe_gen_grad_norm={gen_grad_norm:.6f} ({gen_grad_count} params) "
+            f"und_grad_norm={und_grad_norm:.6f} ({und_grad_count} params) | "
+            f"{'OK' if ok else 'WARN: und grads should be 0'}")
+    else:
+        ok = und_has_nonzero and not gen_has_nonzero
+        logger.info(
+            f"[Grad Check step={global_step}] phase={phase} | "
+            f"und_grad_norm={und_grad_norm:.6f} ({und_grad_count} params) "
+            f"moe_gen_grad_norm={gen_grad_norm:.6f} ({gen_grad_count} params) | "
+            f"{'OK' if ok else 'WARN: moe_gen grads should be 0'}")
+
+
+def _log_param_change(transformer, accelerator, phase, global_step, logger,
+                      prev_checksums):
+    """Check if parameters actually changed after optimizer step.
+
+    Uses relative change threshold to distinguish real updates from float noise.
+    """
+    if not accelerator.is_main_process:
+        return prev_checksums
+    unwrapped = accelerator.unwrap_model(transformer)
+    checksums = {}
+    changed_gen = 0
+    changed_und = 0
+    total_gen = 0
+    total_und = 0
+    max_gen_delta = 0.0
+    max_und_delta = 0.0
+    for n, p in unwrapped.named_parameters():
+        if not p.requires_grad:
+            continue
+        # Use mean of absolute values for more stable checksum
+        cs = p.data.float().abs().mean().item()
+        rel_thresh = max(cs * 1e-5, 1e-8)  # relative threshold
+        if 'moe_gen' in n:
+            total_gen += 1
+            if n in prev_checksums:
+                delta = abs(cs - prev_checksums[n])
+                max_gen_delta = max(max_gen_delta, delta)
+                if delta > rel_thresh:
+                    changed_gen += 1
+        else:
+            total_und += 1
+            if n in prev_checksums:
+                delta = abs(cs - prev_checksums[n])
+                max_und_delta = max(max_und_delta, delta)
+                if delta > rel_thresh:
+                    changed_und += 1
+        checksums[n] = cs
+
+    if prev_checksums:
+        if phase == 'generation':
+            ok = changed_gen > 0 and changed_und == 0
+        else:
+            ok = changed_und > 0 and changed_gen == 0
+        logger.info(
+            f"[Param Check step={global_step}] phase={phase} | "
+            f"moe_gen changed={changed_gen}/{total_gen} (max_delta={max_gen_delta:.2e}) "
+            f"und changed={changed_und}/{total_und} (max_delta={max_und_delta:.2e}) | "
+            f"{'OK' if ok else 'WARN'}")
+    return checksums
+
+
+def _set_fsdp_training_mode(transformer, accelerator, use_lora):
+    """Set FSDP wrapper to train mode but inner modules to inference mode.
+
+    Matches original flow_grpo pattern (train_bagel.py L808-819):
+      transformer.train()          → FSDP handles gradients
+      inner.training = False       → Bagel dispatches to forward_inference
+
+    With FSDP auto_wrap, each layer may be independently wrapped,
+    so we set training=False on both the wrapper and inner module.
+    """
+    transformer.train()
+    inner = accelerator.unwrap_model(transformer)
+    inner.training = False
+    inner.model.training = False
+    layers = inner.model.model.layers if use_lora else inner.model.layers
+    if use_lora:
+        inner.model.model.training = False
+    for layer in layers:
+        layer.training = False
+        if hasattr(layer, 'module'):
+            layer.module.training = False
+            if hasattr(layer.module, 'self_attn'):
+                layer.module.self_attn.training = False
+        elif hasattr(layer, 'self_attn'):
+            layer.self_attn.training = False
+
+
 def main(_):
     config = FLAGS.config
 
@@ -340,6 +450,18 @@ def main(_):
 
     n_gpus = accelerator.num_processes
     import math as _math
+    import logging as _logging
+
+    # File logging: write all ranks' logs to a shared log file
+    log_dir = getattr(config, 'logdir', '/adialab/usr/shadabk/MedUMM/flow_grpo/logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"spy_train_{config.run_name}.log")
+    file_handler = _logging.FileHandler(log_file, mode='a')
+    file_handler.setFormatter(_logging.Formatter(
+        f'[%(asctime)s][rank{accelerator.process_index}] %(message)s',
+        datefmt='%H:%M:%S'))
+    _logging.getLogger(__name__).addHandler(file_handler)
+    _logging.getLogger(__name__).setLevel(_logging.INFO)
 
     if accelerator.is_main_process:
         wandb_resume_id = getattr(config, 'wandb_resume_id', None)
@@ -421,6 +543,8 @@ def main(_):
     torch.cuda.empty_cache()
 
     # Create frozen reference model for KL penalty (if beta > 0)
+    # Prepared via accelerator.prepare() so FSDP wraps it with SHARD_GRAD_OP
+    # (same strategy as main transformer — safe for asymmetric forward calls).
     if config.train.beta > 0:
         language_model_ref = Qwen2ForCausalLM(llm_config)
         language_model_ref.load_state_dict(model.language_model.state_dict())
@@ -524,12 +648,12 @@ def main(_):
 
     autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
 
+    # FSDP: transformer + optimizers via accelerator.prepare() (SHARD_GRAD_OP).
+    # Ref model NOT prepared — kept as plain model on each GPU (no FSDP).
+    # This avoids FSDP sharding embed_tokens which breaks direct .model.embed_tokens() calls.
     if decision_training:
-        # Only prepare transformer + gen_optimizer with Accelerator (DDP wrapping).
-        # und_optimizer stays as raw PyTorch optimizer — we handle its gradient sync
-        # manually via all_reduce. This allows us to offload its states to CPU
-        # during generation phase to avoid OOM.
-        transformer, gen_optimizer = accelerator.prepare(transformer, gen_optimizer)
+        transformer, gen_optimizer, und_optimizer = accelerator.prepare(
+            transformer, gen_optimizer, und_optimizer)
     else:
         transformer, gen_optimizer = accelerator.prepare(transformer, gen_optimizer)
     model.language_model = transformer
@@ -551,9 +675,9 @@ def main(_):
             prompt_type=prompt_type,
             num_players=num_players,
         )
-    max_vote_tokens = spy_cfg.get('max_vote_tokens', 512)
+    max_vote_tokens = spy_cfg.get('max_vote_tokens', 1024)
     num_inner_epochs = config.train.num_inner_epochs
-    use_role_advantage = spy_cfg.get('use_role_advantage', False)
+    use_role_advantage = spy_cfg.get('use_role_advantage', True)
     logger.info(f"  Game data: prompt_type={prompt_type}")
     logger.info(f"  God-judge voting: K={spy_cfg.get('god_vote_K', 8)} votes per game")
     logger.info(f"  Role advantage: {'ENABLED' if use_role_advantage else 'DISABLED'}")
@@ -564,7 +688,7 @@ def main(_):
     logger.info(f"  SDE window={config.sample.sde_window_size}")
     games_per_rank = _math.ceil(G / n_gpus)
     logger.info(f"  GPUs={n_gpus}, games_per_rank={games_per_rank} (sequential gen per game)")
-    logger.info(f"  Gradient sync: Accelerator accumulate() (gen) / manual all_reduce (decision)")
+    logger.info(f"  Gradient sync: FSDP + Accelerator accumulate() (both gen & decision)")
     logger.info(f"  Backward calls per rank per inner epoch: "
                 f"{games_per_rank}(games/rank) x {num_players}(players) x {config.sample.sde_window_size}(sde) "
                 f"= {games_per_rank * num_players * config.sample.sde_window_size}")
@@ -597,24 +721,9 @@ def main(_):
                 logger.info(f"  Resuming from epoch/step {start_epoch}")
         else:
             logger.warning(f"Resume checkpoint not found: {ckpt_file}, training from scratch")
-
-    # One-time training mode setup (avoid per-epoch layer traversal)
-    transformer.train()
-    _unwrapped_setup = accelerator.unwrap_model(transformer)
-    _unwrapped_setup.training = False
-    _unwrapped_setup.model.training = False
-    if config.use_lora:
-        _unwrapped_setup.model.model.training = False
-        for _layer in _unwrapped_setup.model.model.layers:
-            _layer.training = False
-            if hasattr(_layer, 'self_attn'):
-                _layer.self_attn.training = False
-    else:
-        for _layer in _unwrapped_setup.model.layers:
-            _layer.training = False
-            if hasattr(_layer, 'self_attn'):
-                _layer.self_attn.training = False
-    del _unwrapped_setup
+    
+    # Initial training mode: FSDP wrapper train + inner modules inference dispatch
+    _set_fsdp_training_mode(transformer, accelerator, config.use_lora)
 
     batch_time_start = time.time()
 
@@ -624,19 +733,11 @@ def main(_):
             torch.cuda.empty_cache()
 
         # ── Eval & Checkpoint ────────────────────────────────────
-        # [ACCEL PATCH 4] DDP-compatible checkpoint save (replaces save_fsdp_checkpoint)
+        # FSDP checkpoint save
         if not config.debug and epoch > 0 and epoch % config.save_freq == 0:
-            if accelerator.is_main_process:
-                from safetensors.torch import save_file as _save_file
-                save_path = os.path.join(config.save_dir, f"checkpoint-{global_step}")
-                os.makedirs(save_path, exist_ok=True)
-                unwrapped = accelerator.unwrap_model(transformer)
-                state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()
-                              if 'moe_gen' in k}
-                _save_file(state_dict, os.path.join(save_path, "model.safetensors"))
-                logger.info(f"Checkpoint saved: {save_path} ({len(state_dict)} tensors)")
-                del state_dict
-            accelerator.wait_for_everyone()
+            from flow_grpo.fsdp_utils import save_fsdp_checkpoint
+            save_fsdp_checkpoint(config.save_dir, transformer, global_step,
+                                 accelerator.process_index)
 
         # ── Sampling: G games ────────────────────────────────────
         transformer.eval()
@@ -650,18 +751,13 @@ def main(_):
         epoch_civ_rewards = []
         t_gen_total, t_vote_total = 0.0, 0.0
 
-        # Use unwrapped model for all inference (DDP wrapping breaks .model access)
-        wrapped_lm_save = model.language_model
-        model.language_model = accelerator.unwrap_model(transformer)
+        # FSDP: keep model.language_model as the FSDP-wrapped transformer
+        # (set at accelerator.prepare). Do NOT unwrap — FSDP manages parameter sharding.
 
         rank = accelerator.process_index
         n_gpus = accelerator.num_processes
 
-        # ================================================================
-        # PHASE 1: Sequential generation — each player sees previous images
-        # Parallelism: each GPU handles a subset of GAMES (not players).
-        # Within each game, players generate sequentially: 1 → 2 → 3 → 4.
-        # ================================================================
+        # ── PHASE 1 + 2 setup ──────────────────────────────────────
         t_gen_start = time.time()
         all_my_trajs = []   # [G] dict mapping pid -> traj
         all_my_images = []  # [G] dict mapping pid -> image tensor
@@ -670,7 +766,8 @@ def main(_):
         for g in range(G):
             all_game_data_list.append(game_generator.generate_game(epoch * G + g, global_step))
 
-        # Each GPU handles its subset of games
+
+        # Distribute games across GPUs (round-robin)
         my_game_ids_gen = [g for g in range(G) if g % n_gpus == rank]
 
         # Initialize per-game storage for all G games
@@ -689,23 +786,32 @@ def main(_):
         all_game_vote_infos = {}  # g -> list of K vote parse results (including None)
 
         # ================================================================
-        # PHASE 1+2 PIPELINE: Generate + Vote per game (no cross-GPU wait)
-        # Each GPU generates all players for a game, then immediately votes.
-        # Voting uses LOCAL images (no all_reduce needed for voting).
+        # PHASE 1: Image generation — each GPU generates its assigned games
+        # SHARD_GRAD_OP: full params on each GPU, no cross-rank sync during forward.
+        # Players generate sequentially within each game (spy sees prev images).
+        #
+        # Data flow (matches flow_grpo pattern):
+        #   game_data → build_generation_input_list → interleave_inference
+        #   → pre-stack latents/log_probs (avoid repeated stack in backward)
+        #   → convert to PIL once (reused for voting + backward prev_images)
         # ================================================================
+        _t_gen_s = time.time()
+        all_game_prev_pils_local = {}  # g -> [pid -> list of prev player PILs]
         with autocast():
             for g in my_game_ids_gen:
                 game_data = all_game_data_list[g]
                 spy_player = game_data['spy_player']
-                game_pil_images = []
+                game_pil_images = []   # accumulated PILs for spy context
+                game_prev_pils = []    # per-player prev_images for backward
 
-                # ── Generate all players for this game ──
                 for pid in range(num_players):
                     player_id = pid + 1
+                    # Spy sees previous players' images; civilians generate independently
                     if player_id == spy_player:
                         prev_images = list(game_pil_images)
                     else:
                         prev_images = []
+                    game_prev_pils.append(list(prev_images))
 
                     input_list = game_generator.build_generation_input_list(
                         game_data, player_id, prev_images)
@@ -722,63 +828,93 @@ def main(_):
                         )
                     result = output_dict[0] if isinstance(output_dict, list) else output_dict
 
+                    # Pre-stack latents/log_probs during sampling (flow_grpo pattern)
+                    # so backward doesn't need to re-stack every inner epoch
                     all_my_trajs[g][pid] = {
                         'image': result['image'],
-                        'all_latents': result['all_latents'],
-                        'all_log_probs': result['all_log_probs'],
+                        'latents': torch.stack(result['all_latents']),
+                        'log_probs': torch.stack(result['all_log_probs']),
                         'timesteps': result['timesteps'],
                     }
                     all_my_images[g][pid] = result['image']
 
+                    # Convert to PIL once — reused for voting, logging, and backward
                     pil_img = tensor_images_to_pil(result['image'].unsqueeze(0).float())[0]
                     game_pil_images.append(pil_img)
 
-                # ── Immediately vote for this game (uses local images, no all_reduce needed) ──
-                player_pils = game_pil_images  # reuse PIL images from generation
-                all_game_pils[g] = player_pils
-
-                god_prompt = game_generator.format_voting_prompt(
+                all_game_pils[g] = game_pil_images
+                all_game_prev_pils_local[g] = game_prev_pils
+                all_game_god_prompts[g] = game_generator.format_voting_prompt(
                     game_data, player_id=None,
                     god_sees_description=spy_cfg.get('god_sees_description', False))
-                all_game_god_prompts[g] = god_prompt
 
-                with torch.no_grad():
-                    if decision_training:
-                        vote_samples = sample_vote_with_logprobs(
-                            inferencer, player_pils, god_prompt,
-                            num_generations=god_vote_K,
-                            max_tokens=max_vote_tokens,
-                            temperature=spy_cfg.get('decision_temperature', 0.7))
+            _t_gen_only = time.time() - _t_gen_s
+
+            # ── PHASE 2: Batched voting — all games' votes in one packed forward ──
+            _t_vote_s = time.time()
+            batch_pils = [all_game_pils[g] for g in my_game_ids_gen]
+            batch_prompts = [all_game_god_prompts[g] for g in my_game_ids_gen]
+
+            with torch.no_grad():
+                if decision_training:
+                    batch_vote_results = batch_sample_vote_with_logprobs(
+                        inferencer, batch_pils, batch_prompts,
+                        num_generations=god_vote_K,
+                        max_tokens=max_vote_tokens,
+                        temperature=spy_cfg.get('decision_temperature', 0.7),
+                        return_base_kv=True)
+                    for idx, g in enumerate(my_game_ids_gen):
+                        vote_samples, base_cached_kv = batch_vote_results[idx]
                         all_vote_samples[g] = vote_samples
-                        vote_texts = [vs['text'] for vs in vote_samples]
-                    else:
-                        vote_texts = run_bagel_vote_multi_image_repeated(
-                            inferencer, player_pils, god_prompt,
-                            num_generations=god_vote_K,
-                            max_tokens=max_vote_tokens,
-                            temperature=spy_cfg.get('decision_temperature', 0.9),
-                        )
+                        all_vote_samples[f'{g}_kv'] = base_cached_kv
+                else:
+                    batch_vote_results = batch_sample_vote_with_logprobs(
+                        inferencer, batch_pils, batch_prompts,
+                        num_generations=god_vote_K,
+                        max_tokens=max_vote_tokens,
+                        temperature=spy_cfg.get('decision_temperature', 0.9),
+                        return_base_kv=False)
 
-                # Parse votes and save raw results (including None for invalid)
-                game_vote_infos = []
-                for vtext in vote_texts:
-                    vote_info = game_generator.extract_vote(vtext)
-                    game_vote_infos.append(vote_info)  # None if parse failed
-                    if vote_info and isinstance(vote_info.get('voted_spy'), int):
-                        voted_pid = vote_info['voted_spy']
-                        if 1 <= voted_pid <= num_players:
-                            all_vote_count_tensors[g, voted_pid - 1] += 1
-                all_game_vote_infos[g] = game_vote_infos
+        # Parse votes for all games
+        for idx, g in enumerate(my_game_ids_gen):
+            if decision_training:
+                vote_samples_g = all_vote_samples[g]
+                vote_texts = [vs['text'] for vs in vote_samples_g]
+            else:
+                vote_texts = [vs['text'] for vs in batch_vote_results[idx]]
 
-                if g == 0 and rank == 0:
-                    first_game_vote_texts = vote_texts
-                    first_game_god_prompt = god_prompt
+            game_vote_infos = []
+            for vtext in vote_texts:
+                vote_info = game_generator.extract_vote(vtext)
+                game_vote_infos.append(vote_info)
+                if vote_info and isinstance(vote_info.get('voted_spy'), int):
+                    voted_pid = vote_info['voted_spy']
+                    if 1 <= voted_pid <= num_players:
+                        all_vote_count_tensors[g, voted_pid - 1] += 1
+            all_game_vote_infos[g] = game_vote_infos
+
+            if g == my_game_ids_gen[0] and rank == 0:
+                first_game_vote_texts = vote_texts
+                first_game_god_prompt = all_game_god_prompts[g]
+
+        _t_vote_only = time.time() - _t_vote_s
+        t_gen_total = _t_gen_only
+        t_vote_total = _t_vote_only
+        
+        # Determine training phase early (needed for all_reduce decision)
+        if decision_training:
+            cycle_length = spy_cfg.get('phase_cycle_length', 10)
+            total_cycle = cycle_length * 2
+            cycle_pos = global_step % total_cycle
+            training_phase = 'decision' if cycle_pos < cycle_length else 'generation'
+        else:
+            training_phase = 'generation'
 
         # all_reduce vote_counts (always needed for reward)
         torch.distributed.all_reduce(all_vote_count_tensors, op=torch.distributed.ReduceOp.SUM)
 
         # all_reduce images — only needed for generation training backward
-        # (decision training only needs local images, already cached in all_game_pils)
+        # (decision phase uses local PIL images cached in all_game_pils)
         img_shape = None
         for g in my_game_ids_gen:
             img_shape = list(all_my_images[g][0].shape)
@@ -790,56 +926,77 @@ def main(_):
         for g in my_game_ids_gen:
             for pid in range(num_players):
                 all_images_packed[g, pid] = all_my_images[g][pid]
-        if not decision_training or spy_cfg.get('phase_cycle_length', 10) < 100000:
-            # Only sync images if generation training is active or will be soon
+        if training_phase == 'generation':
+            # Only sync full image tensors when generation backward needs them
             torch.distributed.all_reduce(all_images_packed, op=torch.distributed.ReduceOp.SUM)
 
-        t_gen_total = time.time() - t_gen_start  # combined gen+vote time
-        t_vote_total = 0.0  # merged into gen phase
+        t_gen_vote_combined = time.time() - t_gen_start  # combined gen+vote+allreduce time
 
         # ================================================================
-        # Phase 3: Compute rewards for all G games (CPU, fast)
+        # Phase 3: Rewards → Advantages (Vision-Zero strategic reward)
+        #
+        # Flow:  vote_counts → spy_caught → zero-sum rewards → role-adjust → normalize
+        #
+        # vs original flow_grpo:
+        #   flow_grpo: external reward_fn(images, prompts) → gather → normalize
+        #   spy game:  vote_counts → compute_generation_rewards → role-adjust → normalize
+        #
+        # Key difference: rewards come from the game outcome (votes), not external metrics.
+        # Zero-sum guarantees: sum(rewards) = 0 per game.
+        # Role advantage: subtract per-role EMA baseline before normalization
+        # to prevent spy/civ reward imbalance from dominating the advantage signal.
         # ================================================================
+        flat_rewards_raw = []
+        flat_rewards_adj = []
+
         for g in range(G):
             game_data = all_game_data_list[g]
-            player_images_tensor = [all_images_packed[g, pid] for pid in range(num_players)]
+            spy_pid = game_data['spy_player']
 
-            # Build vote_counts dict from God-judge vote count tensor
+            # Vote counts → spy detection (majority vote, unique winner)
             vote_counts = {pid + 1: all_vote_count_tensors[g, pid].item()
                            for pid in range(num_players)}
-
-            # Build game_outcome compatible with compute_generation_rewards
-            spy_pid = game_data['spy_player']
             max_votes = max(vote_counts.values())
             spy_caught = (vote_counts[spy_pid] == max_votes and
                           sum(1 for v in vote_counts.values() if v == max_votes) == 1)
+
+            # Zero-sum generation rewards (Vision-Zero: Ψ-based formula)
             game_outcome = {
-                "player_rewards": {pid + 1: 0.0 for pid in range(num_players)},
                 "spy_caught": spy_caught,
                 "vote_counts": vote_counts,
                 "spy_player": spy_pid,
+                "player_rewards": {pid + 1: 0.0 for pid in range(num_players)},
             }
-
-            # Use raw vote parse results for statistics (includes None for invalid)
-            game_votes = all_game_vote_infos.get(g, [])
-
             gen_rewards = game_generator.compute_generation_rewards(
-                game_outcome,
-                beta=spy_cfg.reward_beta,
-                lambda_param=spy_cfg.reward_lambda,
-            )
+                game_outcome, beta=spy_cfg.reward_beta, lambda_param=spy_cfg.reward_lambda)
 
-            if game_outcome['spy_caught']:
+            # Role advantage: subtract per-role EMA baseline (before normalization)
+            if use_role_advantage:
+                adj_rewards = game_generator.apply_role_advantage(gen_rewards, spy_pid)
+            else:
+                adj_rewards = gen_rewards
+
+            # Update EMA baselines with current data (for next epoch)
+            civ_rs = [gen_rewards[i] for i in range(num_players) if i != spy_pid - 1]
+            game_generator.update_baselines(
+                gen_rewards[spy_pid - 1],
+                sum(civ_rs) / len(civ_rs) if civ_rs else 0.0)
+
+            # Accumulate flat reward lists (G*N entries, same order as advantages index)
+            flat_rewards_raw.extend(gen_rewards)
+            flat_rewards_adj.extend(adj_rewards)
+
+            # Track stats
+            if spy_caught:
                 spy_caught_count += 1
             total_games += 1
-
-            spy_pid = game_data['spy_player']
             epoch_spy_rewards.append(gen_rewards[spy_pid - 1])
             for i, r in enumerate(gen_rewards):
                 if i != spy_pid - 1:
                     epoch_civ_rewards.append(r)
 
-            # Build player_trajs for training
+            # Build per-game training data
+            player_images_tensor = [all_images_packed[g, pid] for pid in range(num_players)]
             player_trajs = [None] * num_players
             for pid in range(num_players):
                 if pid in all_my_trajs[g]:
@@ -850,32 +1007,13 @@ def main(_):
             all_game_trajs.append(player_trajs)
             all_game_rewards.append(gen_rewards)
             all_game_images_t.append(player_images_tensor)
-            all_game_votes.append(game_votes)
+            all_game_votes.append(all_game_vote_infos.get(g, []))
             all_game_outcomes.append(game_outcome)
 
-        # ── Group-relative advantages ────────────────────────────
-        # First apply role advantage using PREVIOUS epoch's baseline (before update)
-        if use_role_advantage:
-            adjusted_rewards = []
-            for g in range(G):
-                spy_pid = all_game_data_list[g]['spy_player']
-                adj = game_generator.apply_role_advantage(all_game_rewards[g], spy_pid)
-                adjusted_rewards.append(adj)
-            flat_rewards_raw = [r for rw in all_game_rewards for r in rw]
-            flat_rewards = [r for rw in adjusted_rewards for r in rw]
-        else:
-            flat_rewards_raw = [r for rw in all_game_rewards for r in rw]
-            flat_rewards = flat_rewards_raw
-
-        # NOW update baselines with current epoch's data (for next epoch)
-        for g in range(G):
-            spy_pid = all_game_data_list[g]['spy_player']
-            spy_r = all_game_rewards[g][spy_pid - 1]
-            civ_rs = [all_game_rewards[g][i] for i in range(num_players) if i != spy_pid - 1]
-            game_generator.update_baselines(spy_r, sum(civ_rs) / len(civ_rs) if civ_rs else 0.0)
-
-        # Vision-Zero: role-adjusted rewards → group-level mean/std normalization
-        advantages = compute_group_advantages(flat_rewards).to(accelerator.device)
+        # Group-level mean/std normalization → advantages (matches flow_grpo's advantage computation)
+        # flow_grpo: advantages = (rewards - mean) / (std + eps)  [global across all samples]
+        # spy game:  same formula but on role-adjusted rewards [across G*N trajectories]
+        advantages = compute_group_advantages(flat_rewards_adj).to(accelerator.device)
 
         # ── [ACCEL PATCH 3] Async Logging (non-blocking, runs in background thread) ──
         if accelerator.is_main_process:
@@ -890,7 +1028,7 @@ def main(_):
                 _async_log_metrics,
                 images_for_log, list(all_game_data_list), list(all_game_rewards),
                 list(all_game_votes), list(all_game_outcomes), list(flat_rewards_raw),
-                list(flat_rewards), adv_cpu, list(epoch_spy_rewards), list(epoch_civ_rewards),
+                list(flat_rewards_adj), adv_cpu, list(epoch_spy_rewards), list(epoch_civ_rewards),
                 spy_caught_count, total_games, game_generator,
                 use_role_advantage, G, num_players, t_gen_total, t_vote_total,
                 batch_time, epoch, global_step, config,
@@ -944,159 +1082,128 @@ def main(_):
                 except Exception:
                     pass
 
-        # ── Determine training phase ──────────────────────────────
-        if decision_training:
-            cycle_length = spy_cfg.get('phase_cycle_length', 10)
-            total_cycle = cycle_length * 2
-            cycle_pos = global_step % total_cycle
-            # Decision first, then generation
-            training_phase = 'decision' if cycle_pos < cycle_length else 'generation'
-        else:
-            training_phase = 'generation'
+        # training_phase already determined above (before all_reduce)
 
-        # Training mode already set before epoch loop (one-time setup)
+        # FSDP: optimizer states are sharded across GPUs, no manual offload needed
 
-        # Offload und_optimizer states to CPU during generation phase to prevent OOM.
-        # und_optimizer is a raw PyTorch optimizer (not Accelerator-wrapped), so we can
-        # freely move its states. This saves ~28GB during generation backward.
-        if decision_training and und_optimizer is not None:
-            device = accelerator.device
-            if training_phase == 'generation':
-                # Offload und_optimizer states + ref model to CPU (save ~42GB)
-                for state in und_optimizer.state.values():
-                    for k, v in state.items():
-                        if torch.is_tensor(v) and v.device.type != 'cpu':
-                            state[k] = v.cpu()
-                if hasattr(model, 'language_model_ref') and model.language_model_ref is not None:
-                    model.language_model_ref.cpu()
-                torch.cuda.empty_cache()
-                if accelerator.is_main_process:
-                    mem_gb = torch.cuda.memory_allocated() / 1024**3
-                    logger.info(f"  [OFFLOAD→CPU] und_opt + ref_model. GPU mem: {mem_gb:.1f}GB")
-            elif training_phase == 'decision':
-                # Restore und_optimizer states + ref model to GPU
-                for state in und_optimizer.state.values():
-                    for k, v in state.items():
-                        if torch.is_tensor(v) and v.device.type == 'cpu':
-                            state[k] = v.to(device)
-                if hasattr(model, 'language_model_ref') and model.language_model_ref is not None:
-                    model.language_model_ref.to(device)
-                if accelerator.is_main_process:
-                    mem_gb = torch.cuda.memory_allocated() / 1024**3
-                    logger.info(f"  [RESTORE→GPU] und_opt + ref_model. GPU mem: {mem_gb:.1f}GB")
+        # Switch back to train mode before backward (matching original flow_grpo)
+        _set_fsdp_training_mode(transformer, accelerator, config.use_lora)
 
-        # Pre-compute PIL images of previous players (only needed for generation backward)
+        # Reuse PIL images computed during Phase 1 for generation backward.
+        # all_game_prev_pils_local[g][pid] has the same prev_images used during sampling,
+        # ensuring backward recomputes the same KV cache as inference.
         all_game_prev_pils = []
         if training_phase == 'generation':
             for g in range(G):
-                spy_player = all_game_data_list[g]['spy_player']
-                game_prev_pils = []
-                accumulated_pils = []
-                for pid in range(num_players):
-                    player_id = pid + 1
-                    if player_id == spy_player:
-                        game_prev_pils.append(list(accumulated_pils))
-                    else:
-                        game_prev_pils.append([])
-                    pil_img = tensor_images_to_pil(all_images_packed[g, pid].unsqueeze(0).float())[0]
-                    accumulated_pils.append(pil_img)
-                all_game_prev_pils.append(game_prev_pils)
+                if g in all_game_prev_pils_local:
+                    all_game_prev_pils.append(all_game_prev_pils_local[g])
+                else:
+                    # Game not on this rank — placeholder (won't be used in backward)
+                    all_game_prev_pils.append([[] for _ in range(num_players)])
 
-        # Restore wrapped model for training backward
-        model.language_model = wrapped_lm_save
+        # FSDP: model.language_model stays as FSDP-wrapped transformer throughout
 
         rank = accelerator.process_index
         n_gpus = accelerator.num_processes
 
-        # Set gradient_accumulation_steps so Accelerator's accumulate() mechanism
-        # inside generate_image_learn() works correctly.
-        # generate_image_learn() calls accumulate(transformer) + optimizer.step() for each SDE step.
-        # Accumulate counts up and only does a real step() every GA steps.
-        # We want 1 real optimizer step per (games_per_rank * num_players * sde_window) backward calls.
+        # Set gradient_accumulation_steps per phase so Accelerator's accumulate()
+        # mechanism triggers optimizer.step() only once per epoch.
         games_per_rank = len([g for g in range(G) if g % n_gpus == rank])
-        accelerator.gradient_accumulation_steps = games_per_rank * num_players * config.sample.sde_window_size
+        if training_phase == 'generation':
+            # Generation: 1 backward per (game, player, sde_step)
+            accelerator.gradient_accumulation_steps = games_per_rank * num_players * config.sample.sde_window_size
+        else:
+            # Decision: 1 backward per (game, vote_sample_k)
+            accelerator.gradient_accumulation_steps = games_per_rank * god_vote_K
 
         info = defaultdict(list)
         my_game_ids_train = set(g for g in range(G) if g % n_gpus == rank)
+        _t_backward_start = time.time()
+
+        # Snapshot params before backward for change detection (first 10 epochs only)
+        _param_checksums = {}
+        if epoch < 10:
+            _param_checksums = _log_param_change(
+                transformer, accelerator, training_phase, global_step, logger, {})
 
         for inner_epoch in range(num_inner_epochs):
 
             if training_phase == 'generation':
                 # ── Generation GRPO backward (moe_gen params) ──
-                adv_idx = 0
-                for g in range(G):
+                # FSDP: all ranks must call forward the same number of times
+                # (FSDP all-gathers params on each forward). Iterate only local
+                # games so all ranks do games_per_rank × num_players forwards.
+                my_game_ids_train_sorted = sorted(my_game_ids_train)
+                for g in my_game_ids_train_sorted:
                     for pid in range(num_players):
-                        has_traj = (g in my_game_ids_train) and ('all_latents' in all_game_trajs[g][pid])
+                        adv_idx = g * num_players + pid
+                        ptraj = all_game_trajs[g][pid]
+                        if 'latents' not in ptraj:
+                            continue
 
-                        if has_traj:
-                            ptraj = all_game_trajs[g][pid]
-                            latents = torch.stack(ptraj['all_latents'])
-                            log_probs = torch.stack(ptraj['all_log_probs'])
-                            timesteps = ptraj['timesteps']
+                        # Pre-stacked during Phase 1 sampling (no repeated stack)
+                        latents = ptraj['latents']
+                        log_probs = ptraj['log_probs']
+                        timesteps = ptraj['timesteps']
 
-                            cur_sample = {
-                                'timesteps': timesteps,
-                                'latents': latents[:-1],
-                                'prev_latents': latents[1:],
-                                'log_probs': log_probs,
-                                'advantages': advantages[adv_idx].unsqueeze(0).expand(
-                                    timesteps.shape[0], -1) if advantages.dim() > 0
-                                    else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
-                                    timesteps.shape[0], 1),
-                            }
-                            cur_sample['dtimesteps'] = torch.cat([
-                                timesteps[:-1] - timesteps[1:],
-                                timesteps[-1:],
-                            ])
+                        cur_sample = {
+                            'timesteps': timesteps,
+                            'latents': latents[:-1],
+                            'prev_latents': latents[1:],
+                            'log_probs': log_probs,
+                            'advantages': advantages[adv_idx].unsqueeze(0).expand(
+                                timesteps.shape[0], -1) if advantages.dim() > 0
+                                else advantages[adv_idx].unsqueeze(0).unsqueeze(0).expand(
+                                timesteps.shape[0], 1),
+                        }
+                        cur_sample['dtimesteps'] = torch.cat([
+                            timesteps[:-1] - timesteps[1:],
+                            timesteps[-1:],
+                        ])
 
-                            prev_pils = all_game_prev_pils[g][pid]
-                            input_list = game_generator.build_generation_input_list(
-                                all_game_data_list[g], pid + 1, prev_pils)
+                        prev_pils = all_game_prev_pils[g][pid]
+                        input_list = game_generator.build_generation_input_list(
+                            all_game_data_list[g], pid + 1, prev_pils)
 
-                            with autocast():
-                                output_dict = inferencer.interleave_inference(
-                                    input_list,
-                                    noise_level=config.sample.noise_level,
-                                    learn=True,
-                                    sample=cur_sample,
-                                    grpo_config=config,
-                                    accelerator=accelerator,
-                                    optimizer=gen_optimizer,
-                                    transformer=transformer,
-                                    num_timesteps=config.sample.num_steps,
-                                    cfg_text_scale=config.sample.guidance_scale,
-                                    **inference_hyper,
-                                )
-                            result = output_dict[0] if isinstance(output_dict, list) else output_dict
+                        with autocast():
+                            output_dict = inferencer.interleave_inference(
+                                input_list,
+                                noise_level=config.sample.noise_level,
+                                learn=True,
+                                sample=cur_sample,
+                                grpo_config=config,
+                                accelerator=accelerator,
+                                optimizer=gen_optimizer,
+                                transformer=transformer,
+                                num_timesteps=config.sample.num_steps,
+                                cfg_text_scale=config.sample.guidance_scale,
+                                **inference_hyper,
+                            )
+                        result = output_dict[0] if isinstance(output_dict, list) else output_dict
 
-                            info["clipfrac"].append(result["clipfrac"])
-                            info["clipfrac_gt_one"].append(result.get("clipfrac_gt_one", result["clipfrac"]))
-                            info["clipfrac_lt_one"].append(result.get("clipfrac_lt_one", result["clipfrac"]))
-                            info["policy_loss"].append(result["policy_loss"])
-                            info["kl_loss"].append(result["kl_loss"])
-                            info["loss"].append(result["loss"])
+                        info["clipfrac"].append(result["clipfrac"])
+                        info["clipfrac_gt_one"].append(result.get("clipfrac_gt_one", result["clipfrac"]))
+                        info["clipfrac_lt_one"].append(result.get("clipfrac_lt_one", result["clipfrac"]))
+                        info["policy_loss"].append(result["policy_loss"])
+                        info["kl_loss"].append(result["kl_loss"])
+                        info["loss"].append(result["loss"])
 
-                            # Check if accelerator performed an actual optimizer step
-                            if accelerator.sync_gradients:
-                                pass  # Gradients were synced and optimizer stepped
-
-                        adv_idx += 1
+                # Generation backward produces grads on ALL trainable params (moe_gen + und),
+                # but gen_optimizer only steps moe_gen. Clear stale und grads directly
+                # (can't use und_optimizer.zero_grad() — accelerator wraps it as no-op
+                # during accumulation).
+                for _n, _p in accelerator.unwrap_model(transformer).named_parameters():
+                    if 'moe_gen' not in _n and _p.grad is not None:
+                        _p.grad.zero_()
 
             elif training_phase == 'decision' and und_optimizer is not None:
                 # ── Decision GRPO backward (und params) ──
-                # (und_optimizer states already restored to GPU in offload block above)
+                # NOTE: FSDP wraps params as non-leaf variables, so we cannot
+                # toggle requires_grad directly. Instead, we zero out moe_gen
+                # gradients after each backward to prevent gen params from updating.
 
-                # Freeze moe_gen params during decision phase
-                for n, p in accelerator.unwrap_model(transformer).named_parameters():
-                    if 'moe_gen' in n:
-                        p.requires_grad = False
-
-                # Unwrap model for sampling + backward
-                model.language_model = accelerator.unwrap_model(transformer)
-
-                for g in range(G):
-                    if g not in my_game_ids_train:
-                        continue
+                # FSDP: iterate only local games (same count per rank)
+                for g in sorted(my_game_ids_train):
                     if g not in all_vote_samples:
                         continue
                     game_data = all_game_data_list[g]
@@ -1114,49 +1221,71 @@ def main(_):
                         lambda_fmt=spy_cfg.get('decision_lambda_fmt', 0.3),
                         beta_acc=spy_cfg.get('decision_beta_acc', 1.2))
                     dec_advantages = compute_group_advantages(dec_rewards)
+                    info["decision_reward_mean"].append(torch.tensor(np.mean(dec_rewards)))
+                    info["decision_reward_std"].append(torch.tensor(np.std(dec_rewards)))
+                    info["decision_advantage_abs_max"].append(torch.tensor(max(abs(a) for a in dec_advantages.tolist())))
 
-                    # Build KV cache ONCE per game (images + prompt encoding)
-                    cached_kv = build_vote_kv_cache(
-                        model, inferencer.tokenizer, inferencer.new_token_ids,
-                        player_pils, god_prompt)
+                    # Reuse KV cache from Phase 2 sampling (avoids redundant VIT+text encoding)
+                    cached_kv = all_vote_samples.get(f'{g}_kv')
+                    if cached_kv is None:
+                        cached_kv = build_vote_kv_cache(
+                            model, inferencer.tokenizer, inferencer.new_token_ids,
+                            player_pils, god_prompt)
 
                     # Text GRPO backward for each vote sample (reusing cached KV)
                     for k, vs in enumerate(vote_samples):
-                        loss, loss_info = compute_text_grpo_loss(
-                            model, inferencer.tokenizer, inferencer.new_token_ids,
-                            inferencer, player_pils, god_prompt, vs,
-                            advantage=dec_advantages[k].item(),
-                            clip_range=spy_cfg.get('decision_clip_range', 0.2),
-                            kl_beta=spy_cfg.get('decision_kl_beta', 0.04),
-                            cached_kv=cached_kv)
-                        accelerator.backward(loss)
+                        with accelerator.accumulate(transformer):
+                            loss, loss_info = compute_text_grpo_loss(
+                                model, inferencer.tokenizer, inferencer.new_token_ids,
+                                inferencer, player_pils, god_prompt, vs,
+                                advantage=dec_advantages[k].item(),
+                                clip_range=spy_cfg.get('decision_clip_range', 0.2),
+                                kl_beta=spy_cfg.get('decision_kl_beta', 0.04),
+                                cached_kv=cached_kv)
+                            accelerator.backward(loss)
+                            # Zero out moe_gen gradients (FSDP-safe: no requires_grad toggle)
+                            for n, p in accelerator.unwrap_model(transformer).named_parameters():
+                                if 'moe_gen' in n and p.grad is not None:
+                                    p.grad.zero_()
+                            if accelerator.sync_gradients:
+                                torch.nn.utils.clip_grad_norm_(
+                                    transformer.parameters(),
+                                    config.train.max_grad_norm or 1.0)
+                            und_optimizer.step()
+                            und_optimizer.zero_grad()
                         info["decision_loss"].append(loss.detach())
                         info["decision_clipfrac"].append(
                             torch.tensor(loss_info['text_clipfrac']))
                         if loss_info.get('text_kl_mean', 0) > 0:
                             info["decision_kl"].append(
                                 torch.tensor(loss_info['text_kl_mean']))
+                        info["decision_token_len"].append(
+                            torch.tensor(float(loss_info['text_seq_len'])))
                         del loss
 
-                # Restore: unfreeze moe_gen, restore wrapped model
-                for n, p in accelerator.unwrap_model(transformer).named_parameters():
-                    if 'moe_gen' in n:
-                        p.requires_grad = True
-                model.language_model = wrapped_lm_save
-
-                # Gradient sync + und_optimizer step
-                if n_gpus > 1:
-                    for param in transformer.parameters():
-                        if param.grad is not None:
-                            torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in transformer.parameters() if p.grad is not None],
-                    config.train.max_grad_norm or 1.0)
-                und_optimizer.step()
-                und_optimizer.zero_grad()
+                # FSDP handles gradient sync automatically via accumulate()
                 if und_scheduler is not None:
                     und_scheduler.step()
                 gen_optimizer.zero_grad()  # Clear any stray gen grads
+                # Free cached KV from Phase 2
+                for g in list(all_vote_samples.keys()):
+                    if isinstance(g, str) and g.endswith('_kv'):
+                        del all_vote_samples[g]
+
+            # ── Gradient & parameter update diagnostics (first 10 epochs) ──
+            if epoch < 10:
+                _log_grad_diagnostics(transformer, accelerator, training_phase,
+                                      global_step, logger)
+                _param_checksums = _log_param_change(
+                    transformer, accelerator, training_phase, global_step, logger,
+                    _param_checksums)
+
+            # Free sampling/voting caches at end of inner epoch to reduce memory pressure
+            del all_vote_samples, all_game_prev_pils_local
+            all_vote_samples = {}
+            all_game_prev_pils_local = {}
+
+            _t_backward_total = time.time() - _t_backward_start
 
             if info and accelerator.is_main_process:
                 log_info = {}
@@ -1166,8 +1295,18 @@ def main(_):
                 if "policy_loss" in log_info:
                     log_info["abs_policy_loss"] = abs(log_info["policy_loss"])
                 log_info.update({"epoch": epoch, "inner_epoch": inner_epoch,
-                                 "training_phase": 0 if training_phase == 'generation' else 1})
+                                 "training_phase": 0 if training_phase == 'generation' else 1,
+                                 })
                 wandb.log(log_info, step=global_step)
+
+            # Print phase timing to stdout for monitoring
+            if accelerator.is_main_process:
+                logger.info(
+                    f"[Step {global_step}] phase={training_phase} | "
+                    f"gen={_t_gen_only:.1f}s vote={_t_vote_only:.1f}s "
+                    f"backward={_t_backward_total:.1f}s "
+                    f"total={_t_gen_only + _t_vote_only + _t_backward_total:.1f}s"
+                )
             global_step += 1
             info = defaultdict(list)
 

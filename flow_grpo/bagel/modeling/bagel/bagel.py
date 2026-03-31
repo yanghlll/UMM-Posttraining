@@ -1246,7 +1246,7 @@ class Bagel(PreTrainedModel):
 
         while step < max_length:
             generated_sequence.append(curr_tokens)
-            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            packed_text_embedding = self.language_model.forward(mode="get_embeddings", input_ids=curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
                 0, batch_size, device=device, dtype=key_values_lens.dtype)
@@ -1269,7 +1269,7 @@ class Bagel(PreTrainedModel):
                 **extra_inputs,
             )
             past_key_values = output.past_key_values
-            pred_logits = self.language_model.lm_head(output.packed_query_sequence)
+            pred_logits = self.language_model.forward(mode="compute_logits", hidden_state=output.packed_query_sequence)
 
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
@@ -1333,7 +1333,7 @@ class Bagel(PreTrainedModel):
 
         while step < max_length:
             generated_sequence.append(curr_tokens)
-            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            packed_text_embedding = self.language_model.forward(mode="get_embeddings", input_ids=curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
                 0, batch_size, device=device, dtype=key_values_lens.dtype)
@@ -1356,7 +1356,7 @@ class Bagel(PreTrainedModel):
                 **extra_inputs,
             )
             past_key_values = output.past_key_values
-            pred_logits = self.language_model.lm_head(output.packed_query_sequence)
+            pred_logits = self.language_model.forward(mode="compute_logits", hidden_state=output.packed_query_sequence)
 
             # Sample and compute log prob
             log_probs_all = F.log_softmax(pred_logits / temperature, dim=-1)

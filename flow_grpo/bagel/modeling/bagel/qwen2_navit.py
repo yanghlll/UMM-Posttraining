@@ -1105,6 +1105,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
     def forward(self, *args, **kwargs):
         if kwargs.get("mode") == "get_embeddings":
             return self.get_input_embeddings(kwargs['input_ids'])
+        if kwargs.get("mode") == "compute_logits":
+            return self.lm_head(kwargs['hidden_state'])
         if self.training:
             return self.forward_train(*args, **kwargs)
         else:

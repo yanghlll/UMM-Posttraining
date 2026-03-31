@@ -608,13 +608,20 @@ def compute_group_advantages(flat_rewards: List[float], eps: float = 1e-4) -> to
 
 def sample_vote_with_logprobs(inferencer, player_images: List[Image.Image],
                                vote_prompt: str, num_generations: int = 8,
-                               max_tokens: int = 512, temperature: float = 0.7):
+                               max_tokens: int = 512, temperature: float = 0.7,
+                               return_base_kv: bool = False):
     """Sample K votes and return token ids + log_probs for GRPO training.
+
+    Args:
+        return_base_kv: If True, also return the base KV cache (before K-repeat)
+            for reuse in decision backward, avoiding redundant VIT+text encoding.
 
     Returns:
         List of K dicts, each with:
           'text': str, 'token_ids': Tensor [seq_len], 'log_probs': Tensor [seq_len],
           'prompt_len': int (KV cache length before generation)
+        If return_base_kv=True, returns (results, cached_kv_tuple) where
+        cached_kv_tuple = (past_key_values, newlens, new_rope, device, lm, extra_inputs).
     """
     from copy import deepcopy
     from flow_grpo.bagel.data.data_utils import pil_img2rgb
@@ -669,6 +676,15 @@ def sample_vote_with_logprobs(inferencer, player_images: List[Image.Image],
 
         prompt_len = newlens[0]
 
+        # Save base KV cache for reuse in decision backward (before K-repeat)
+        if return_base_kv:
+            lm = model.language_model
+            extra_inputs = {"mode": "und"} if model.use_moe else {}
+            base_cached_kv = (past_key_values, list(newlens), list(new_rope),
+                              device, lm, extra_inputs)
+        else:
+            base_cached_kv = None
+
         # ── Batched generation: K votes in one packed forward pass ──
         batch_kv = NaiveCache(model.config.llm_config.num_hidden_layers)
         for layer_idx in range(model.config.llm_config.num_hidden_layers):
@@ -722,7 +738,182 @@ def sample_vote_with_logprobs(inferencer, player_images: List[Image.Image],
             'prompt_len': prompt_len,
         })
 
+    if return_base_kv:
+        return results, base_cached_kv
     return results
+
+
+def batch_sample_vote_with_logprobs(inferencer, all_player_images: List[List[Image.Image]],
+                                     all_vote_prompts: List[str],
+                                     num_generations: int = 8,
+                                     max_tokens: int = 512, temperature: float = 0.7,
+                                     return_base_kv: bool = False):
+    """Batched voting across multiple games — builds KV caches for all games in
+    one packed pass, then generates G*K votes in a single batched forward.
+
+    Args:
+        all_player_images: List of G lists, each containing N player PIL images.
+        all_vote_prompts: List of G vote prompt strings.
+        num_generations: K votes per game.
+        return_base_kv: If True, return per-game base KV caches for decision backward.
+
+    Returns:
+        List of G results, each is (vote_samples, cached_kv) if return_base_kv
+        else just vote_samples (List of K dicts).
+    """
+    from flow_grpo.bagel.data.data_utils import pil_img2rgb
+    from flow_grpo.bagel.modeling.bagel.qwen2_navit import NaiveCache
+
+    vlm_transform = build_vlm_image_transform()
+    model = inferencer.model
+    tokenizer = inferencer.tokenizer
+    new_token_ids = inferencer.new_token_ids
+    device = next(model.parameters()).device
+
+    num_games = len(all_player_images)
+    num_players_per_game = len(all_player_images[0])
+
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+        past_key_values = NaiveCache(model.config.llm_config.num_hidden_layers)
+        newlens = [0] * num_games
+        new_rope = [0] * num_games
+
+        # Interleaved: [label] [image] for each player, across all games in parallel
+        for pid in range(num_players_per_game):
+            # Text labels for this player across all games
+            prompts = [f"Player {pid+1}'s generated image:"] * num_games
+            gi, newlens, new_rope = model.prepare_prompts(
+                curr_kvlens=newlens, curr_rope=new_rope,
+                prompts=prompts, tokenizer=tokenizer,
+                new_token_ids=new_token_ids,
+            )
+            for k, v in gi.items():
+                if torch.is_tensor(v): gi[k] = v.to(device)
+            past_key_values = model.forward_cache_update_text(past_key_values, **gi)
+
+            # Images for this player across all games
+            images_rgb = [pil_img2rgb(all_player_images[g][pid]) for g in range(num_games)]
+            gi, newlens, new_rope = model.prepare_vit_images(
+                curr_kvlens=newlens, curr_rope=new_rope,
+                images=images_rgb, transforms=vlm_transform,
+                new_token_ids=new_token_ids,
+            )
+            for k, v in gi.items():
+                if torch.is_tensor(v): gi[k] = v.to(device)
+            past_key_values = model.forward_cache_update_vit(past_key_values, **gi)
+
+        # Vote prompts (different per game)
+        vote_prompts = ["\n" + p for p in all_vote_prompts]
+        gi, newlens, new_rope = model.prepare_prompts(
+            curr_kvlens=newlens, curr_rope=new_rope,
+            prompts=vote_prompts, tokenizer=tokenizer,
+            new_token_ids=new_token_ids,
+        )
+        for k, v in gi.items():
+            if torch.is_tensor(v): gi[k] = v.to(device)
+        past_key_values = model.forward_cache_update_text(past_key_values, **gi)
+
+        prompt_lens = list(newlens)  # per-game prompt lengths
+
+        # Compute per-game cache boundaries (used for both KV extraction and K-repeat)
+        cum_lens = [0]
+        for nl in newlens:
+            cum_lens.append(cum_lens[-1] + nl)
+
+        # Save per-game base KV caches for decision backward reuse
+        # Extract each game's slice from the packed cache so compute_text_grpo_loss
+        # receives a single-game cache (not the full packed multi-game cache).
+        base_cached_kvs = [None] * num_games
+        if return_base_kv:
+            lm = model.language_model
+            extra_inputs = {"mode": "und"} if model.use_moe else {}
+            num_layers = model.config.llm_config.num_hidden_layers
+            for g in range(num_games):
+                start, end = cum_lens[g], cum_lens[g + 1]
+                game_kv = NaiveCache(num_layers)
+                for li in range(num_layers):
+                    game_kv.key_cache[li] = past_key_values.key_cache[li][start:end]
+                    game_kv.value_cache[li] = past_key_values.value_cache[li][start:end]
+                base_cached_kvs[g] = (game_kv, [newlens[g]], [new_rope[g]],
+                                       device, lm, extra_inputs)
+
+        # ── Replicate each game's KV cache K times for batched generation ──
+        # Current packed cache: game0_kv | game1_kv | ... in contiguous memory
+        # Need: game0_copy1 | game0_copy2 | ... | game1_copy1 | game1_copy2 | ...
+
+        batch_kv = NaiveCache(model.config.llm_config.num_hidden_layers)
+        K = num_generations
+        for layer_idx in range(model.config.llm_config.num_hidden_layers):
+            orig_k = past_key_values.key_cache[layer_idx]
+            orig_v = past_key_values.value_cache[layer_idx]
+            # Extract and repeat each game's slice
+            k_parts = []
+            v_parts = []
+            for g in range(num_games):
+                start, end = cum_lens[g], cum_lens[g + 1]
+                k_parts.append(orig_k[start:end].repeat(K, 1, 1))
+                v_parts.append(orig_v[start:end].repeat(K, 1, 1))
+            batch_kv.key_cache[layer_idx] = torch.cat(k_parts, dim=0)
+            batch_kv.value_cache[layer_idx] = torch.cat(v_parts, dim=0)
+
+        # Build newlens/new_rope for G*K sequences
+        batch_newlens = []
+        batch_new_rope = []
+        for g in range(num_games):
+            batch_newlens.extend([newlens[g]] * K)
+            batch_new_rope.extend([new_rope[g]] * K)
+
+        gen_input = model.prepare_start_tokens(batch_newlens, batch_new_rope, new_token_ids)
+        for k, v in gen_input.items():
+            if torch.is_tensor(v): gen_input[k] = v.to(device)
+
+        gen_ids, gen_logps = model.generate_text_with_logprobs(
+            past_key_values=batch_kv,
+            max_length=max_tokens,
+            temperature=temperature,
+            end_token_id=new_token_ids['eos_token_id'],
+            **gen_input,
+        )
+        # gen_ids: [max_steps+1, G*K], gen_logps: [max_steps, G*K]
+        del batch_kv
+
+    # Split results by game, then by K
+    eos_id = new_token_ids['eos_token_id']
+    eos_val = eos_id.item() if torch.is_tensor(eos_id) else eos_id
+
+    all_results = []
+    for g in range(num_games):
+        game_results = []
+        for ki in range(K):
+            b = g * K + ki
+            ids_b = gen_ids[:, b]
+            logps_b = gen_logps[:, b]
+
+            eos_pos = (ids_b == eos_val).nonzero(as_tuple=True)[0]
+            if len(eos_pos) > 0:
+                end = eos_pos[0].item()
+                token_ids = ids_b[1:end]
+                log_probs = logps_b[:max(end - 1, 0)]
+            else:
+                token_ids = ids_b[1:]
+                log_probs = logps_b
+
+            text = tokenizer.decode(ids_b)
+            text = text.split('<|im_end|>')[0]
+            if '<|im_start|>' in text:
+                text = text.split('<|im_start|>')[1]
+
+            game_results.append({
+                'text': text,
+                'token_ids': token_ids.cpu(),
+                'log_probs': log_probs.cpu(),
+                'prompt_len': prompt_lens[g],
+            })
+        all_results.append(game_results)
+
+    if return_base_kv:
+        return [(all_results[g], base_cached_kvs[g]) for g in range(num_games)]
+    return all_results
 
 
 def compute_decision_rewards(vote_samples, spy_player, num_players, extract_vote_fn,
@@ -786,7 +977,7 @@ def compute_decision_rewards(vote_samples, spy_player, num_players, extract_vote
             else:
                 acc = -1.0
         elif extracted and extracted.get("voted_spy") == "N/A":
-            acc = -0.5
+            acc = -0.8
         else:
             acc = -1.0
 
@@ -804,7 +995,8 @@ def compute_decision_rewards(vote_samples, spy_player, num_players, extract_vote
 def build_vote_kv_cache(model, tokenizer, new_token_ids, player_images, vote_prompt):
     """Build KV cache for voting context (images + prompt). Reusable across K vote samples.
 
-    Returns (past_key_values, newlens, new_rope, device, lm_unwrapped, extra_inputs).
+    Returns (past_key_values, newlens, new_rope, device, lm, extra_inputs).
+    lm is the (possibly FSDP-wrapped) language model — call through it for FSDP safety.
     """
     from flow_grpo.bagel.data.data_utils import pil_img2rgb
     from flow_grpo.bagel.modeling.bagel.qwen2_navit import NaiveCache
@@ -814,7 +1006,6 @@ def build_vote_kv_cache(model, tokenizer, new_token_ids, player_images, vote_pro
     images_rgb = [pil_img2rgb(img) for img in player_images]
 
     lm = model.language_model
-    lm_unwrapped = lm.module if hasattr(lm, 'module') else lm
     extra_inputs = {"mode": "und"} if model.use_moe else {}
 
     full_prompt = vote_prompt
@@ -853,7 +1044,7 @@ def build_vote_kv_cache(model, tokenizer, new_token_ids, player_images, vote_pro
             if torch.is_tensor(v): gi[k] = v.to(device)
         past_key_values = model.forward_cache_update_text(past_key_values, **gi)
 
-    return past_key_values, newlens, new_rope, device, lm_unwrapped, extra_inputs
+    return past_key_values, newlens, new_rope, device, lm, extra_inputs
 
 
 def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
@@ -893,9 +1084,13 @@ def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
 
     # ── Step 1: Use cached KV or build from scratch ──
     if cached_kv is not None:
-        past_key_values, newlens, new_rope, device, lm_unwrapped, extra_inputs = cached_kv
+        # Handle both 6-tuple (from build_vote_kv_cache) and 7-tuple (from batch_sample with game index)
+        if len(cached_kv) == 7:
+            past_key_values, newlens, new_rope, device, lm, extra_inputs, _game_idx = cached_kv
+        else:
+            past_key_values, newlens, new_rope, device, lm, extra_inputs = cached_kv
     else:
-        past_key_values, newlens, new_rope, device, lm_unwrapped, extra_inputs = \
+        past_key_values, newlens, new_rope, device, lm, extra_inputs = \
             build_vote_kv_cache(model, tokenizer, new_token_ids, player_images, vote_prompt)
 
     # ── Step 2: Batched forward — ALL completion tokens in ONE pass (with grad) ──
@@ -909,14 +1104,15 @@ def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
     rope_start = new_rope[0]
 
     with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-        packed_text_embedding = lm_unwrapped.model.embed_tokens(input_ids)  # [seq_len, hidden]
+        # FSDP-safe: all calls go through lm() which triggers proper unshard/reshard
+        packed_text_embedding = lm(mode="get_embeddings", input_ids=input_ids)  # [seq_len, hidden]
         query_lens = torch.tensor([seq_len], dtype=torch.int, device=device)
         packed_query_indexes = torch.arange(kv_len, kv_len + seq_len, device=device)
         packed_query_position_ids = torch.arange(rope_start, rope_start + seq_len,
                                                   dtype=torch.long, device=device)
         pki = torch.arange(kv_len, device=device)
 
-        output = lm_unwrapped.forward(
+        output = lm(
             packed_query_sequence=packed_text_embedding,
             query_lens=query_lens,
             packed_query_position_ids=packed_query_position_ids,
@@ -929,7 +1125,7 @@ def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
             **extra_inputs,
         )
 
-        logits = lm_unwrapped.lm_head(output.packed_query_sequence)  # [seq_len, vocab]
+        logits = lm(mode="compute_logits", hidden_state=output.packed_query_sequence)  # [seq_len, vocab]
         log_probs_all = F.log_softmax(logits.float() / temperature, dim=-1)
         # Gather log_probs for target tokens
         new_log_probs = log_probs_all.gather(1, target_ids.unsqueeze(1)).squeeze(1)  # [seq_len]
@@ -937,27 +1133,31 @@ def compute_text_grpo_loss(model, tokenizer, new_token_ids, inferencer,
     # ── Step 3: KL penalty from ref model (Vision-Zero: beta=0.04) ──
     per_token_kl = torch.zeros(seq_len, device=device)
     if kl_beta > 0 and hasattr(model, 'language_model_ref'):
+        ref_lm = model.language_model_ref
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            ref_output = model.language_model_ref.forward(
-                packed_query_sequence=lm_unwrapped.model.embed_tokens(input_ids).detach(),
+            # Call through FSDP wrapper (same pattern as _forward_flow with ref_model=True)
+            ref_embeddings = ref_lm(mode="get_embeddings", input_ids=input_ids)
+            ref_output = ref_lm(
+                packed_query_sequence=ref_embeddings.detach(),
                 query_lens=query_lens,
                 packed_query_position_ids=packed_query_position_ids,
                 packed_query_indexes=packed_query_indexes,
-                past_key_values=past_key_values,  # no deepcopy needed: update_past_key_values=False
+                past_key_values=past_key_values,
                 key_values_lens=torch.tensor(newlens, dtype=torch.int, device=device),
                 packed_key_value_indexes=pki,
                 update_past_key_values=False,
                 is_causal=True,
                 **extra_inputs,
             )
-            ref_logits = model.language_model_ref.lm_head(ref_output.packed_query_sequence)
+            ref_logits = ref_lm(mode="compute_logits", hidden_state=ref_output.packed_query_sequence)
             ref_log_probs_all = F.log_softmax(ref_logits.float() / temperature, dim=-1)
             ref_log_probs = ref_log_probs_all.gather(1, target_ids.unsqueeze(1)).squeeze(1)
 
-        # Vision-Zero KL: exp(ref - new) - (ref - new) - 1
+        # Vision-Zero KL: 0.5 * [exp(ref - new) - (ref - new) - 1]
+        # The 0.5 factor matches Vision-Zero's grpo_trainer.py (reverse KL approximation).
         # ref_log_probs is detached (computed under no_grad), gradients flow through new_log_probs
-        per_token_kl = (torch.exp(ref_log_probs - new_log_probs) -
-                        (ref_log_probs - new_log_probs) - 1)
+        per_token_kl = 0.5 * (torch.exp(ref_log_probs - new_log_probs) -
+                              (ref_log_probs - new_log_probs) - 1)
 
     # ── Step 4: PPO-clip loss ──
     adv = torch.tensor(advantage, dtype=torch.float32, device=device)

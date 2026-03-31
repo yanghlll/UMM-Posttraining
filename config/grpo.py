@@ -1131,5 +1131,55 @@ def spy_game_bagel_pickscore():
     return config
 
 
+def spy_game_bagel_decision_only():
+    """Decision-only training on geneval with KL penalty (Vision-Zero aligned).
+
+    Geneval has clearer attribute differences (color/count/position) than pickscore,
+    making spy detection easier → stronger learning signal.
+    two_object tag excluded (swapping A↔B produces near-identical images).
+    N/A penalty increased to -0.8 (from -0.5) to discourage N/A shortcut.
+    """
+    config = spy_game_bagel()
+    config.run_name = "[bagel-spy-decision-geneval]-4gpu"
+    config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/geneval"
+    config.spy_game.prompt_type = "geneval"
+    config.spy_game.god_sees_description = True
+    # Decision-only: always decision phase, no generation backward
+    config.spy_game.decision_training = True
+    config.spy_game.phase_cycle_length = 99999  # decision phase only
+    # KL penalty with ref model (Vision-Zero: beta=0.04)
+    config.train.beta = 0.04                    # creates frozen ref model
+    config.spy_game.decision_kl_beta = 0.04     # KL in decision loss
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/bagel_decision_geneval'
+    config.save_freq = 100
+    return config
+
+
+def spy_game_bagel_debug():
+    """Minimal config for fast FSDP SHARD_GRAD_OP debugging."""
+    config = spy_game_bagel()
+    config.run_name = "[bagel-spy-debug]-4gpu"
+    config.dataset = "/adialab/usr/shadabk/MedUMM/flow_grpo/dataset/pickscore_sfw"
+    config.spy_game.prompt_type = "pickscore"
+    config.spy_game.god_sees_description = True
+    config.spy_game.decision_training = True   # test both phases
+    config.spy_game.phase_cycle_length = 1     # alternate every step
+    config.spy_game.decision_kl_beta = 0       # skip decision KL (no ref needed for decision)
+    # Minimal params for fast debug
+    config.spy_game.num_players = 2
+    config.spy_game.group_size = 4
+    config.spy_game.god_vote_K = 2
+    config.spy_game.max_vote_tokens = 128
+    config.sample.num_steps = 5
+    config.sample.sde_window_size = 2
+    config.sample.sde_window_range = (0, config.sample.num_steps // 2)  # must fit num_steps
+    config.num_epochs = 10
+    config.train.beta = 0  # no ref model to save memory
+    config.save_freq = 999
+    config.save_dir = '/adialab/usr/shadabk/MedUMM/flow_grpo/logs/spy_game/debug'
+    config.debug = True
+    return config
+
+
 def get_config(name):
     return globals()[name]()
